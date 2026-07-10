@@ -1,12 +1,14 @@
 """Final strict validation — the last gate before any Telegram alert.
 
-Every setup received from TradingView is re-validated here from the raw OHLC
-values of the three candles. Nothing computed upstream (in Pine Script or in
-the webhook payload) is trusted: colors, the equal-close rule, the
+Every candidate built by the scan engine is re-validated here from the raw
+OHLC values of the three candles immediately before the duplicate check.
+Nothing computed upstream is trusted: colors, the equal-close rule, the
 third-candle rule, the S/R filter, closed-candle confirmation, entry, stop
-loss, and both take-profit levels are all recomputed and compared.
+loss, and both take-profit levels are all recomputed and compared. This is
+deliberate defense-in-depth against future bugs anywhere in the engine.
 
-If ANY check fails the setup is rejected and no notification is sent.
+If ANY check fails the setup is rejected, logged as a near-miss rejection,
+and no notification is sent.
 """
 
 from __future__ import annotations
@@ -23,12 +25,11 @@ from strategy.models import (
     TamadSetup,
     ValidationReport,
 )
-from strategy.tamad_strategy import LevelBasis
+from strategy.tamad_strategy import ComparisonMode
 
-# Relative tolerance when comparing prices reported by TradingView against
-# values recomputed here. This only absorbs float/serialization noise — it is
-# NOT a strategy tolerance.
-_PRICE_RTOL = 1e-6
+# Relative tolerance when comparing setup fields against values recomputed
+# here. This only absorbs float noise — it is NOT a strategy tolerance.
+_PRICE_RTOL = 1e-9
 
 
 def _prices_match(reported: float, recomputed: float) -> bool:
@@ -52,49 +53,45 @@ class FinalValidator:
         c1, c2, c3 = setup.candles
         direction = setup.direction
 
-        # --- scope: symbol / timeframe -----------------------------------
-        add(
-            CheckResult(
-                "timeframe_allowed",
-                setup.timeframe_minutes in cfg.scanner.timeframe_minutes,
-                f"timeframe {setup.timeframe_minutes}m not in configured timeframes",
-            )
-        )
-        add(
-            CheckResult(
-                "symbol_allowed",
-                cfg.scanner.symbols.allows(setup.symbol),
-                f"symbol {setup.symbol} not in whitelist",
-            )
-        )
-        add(
-            CheckResult(
-                "usdt_perpetual",
-                setup.symbol.endswith(cfg.exchange.symbol_suffix),
-                f"symbol {setup.symbol} is not a {cfg.exchange.symbol_suffix} contract",
-            )
-        )
-
-        # --- candle integrity ---------------------------------------------
+        # --- candle integrity ------------------------------------------------
         sane = all(c.is_sane() for c in setup.candles)
         add(CheckResult("candle_integrity", sane, "OHLC values are inconsistent"))
-        ordered = c1.open_time_ms < c2.open_time_ms < c3.open_time_ms
-        add(CheckResult("candle_order", ordered, "candles are not consecutive in time"))
-        if not (sane and ordered):
-            return ValidationReport(tuple(checks))
-
-        # --- rule 1: candle colors ------------------------------------------
+        step = setup.timeframe_minutes * 60_000
+        consecutive = (
+            c2.open_time_ms - c1.open_time_ms == step
+            and c3.open_time_ms - c2.open_time_ms == step
+        )
         add(
             CheckResult(
-                "candle_colors",
-                rules.candle_colors_valid(direction, c1, c2, c3),
-                f"colors do not match a {direction.value} pattern "
-                "(doji candles are rejected)",
+                "candle_order",
+                consecutive,
+                "candles are not consecutive bars of this timeframe",
             )
         )
+        if not (sane and consecutive):
+            return ValidationReport(tuple(checks))
 
-        # --- rule 2: equal closing price ------------------------------------
-        tolerance = cfg.strategy.equal_close_tolerance_pct
+        # --- rule 1: candle colors -------------------------------------------
+        if direction is Direction.SHORT:
+            expected = (("candle1_color", c1.is_green, "green"),
+                        ("candle2_color", c2.is_red, "red"),
+                        ("candle3_color", c3.is_green, "green"))
+        else:
+            expected = (("candle1_color", c1.is_red, "red"),
+                        ("candle2_color", c2.is_green, "green"),
+                        ("candle3_color", c3.is_red, "red"))
+        for name, ok, want in expected:
+            add(
+                CheckResult(
+                    name,
+                    ok,
+                    f"{name.replace('_color', '')} is not {want} "
+                    "(doji candles are rejected)",
+                )
+            )
+
+        # --- rule 2: equal closing price ---------------------------------------
+        tolerance = cfg.strategy.equal_close.tolerance_percent
         add(
             CheckResult(
                 "equal_close",
@@ -103,9 +100,9 @@ class FinalValidator:
             )
         )
 
-        # --- rule 3: third candle must respect the level --------------------
-        basis = LevelBasis(cfg.strategy.level_basis)
-        level = rules.pattern_level(direction, c1.close, c2.close, basis)
+        # --- rule 3: third candle must respect the level -------------------------
+        mode = ComparisonMode(cfg.strategy.equal_close.comparison_mode)
+        level = rules.pattern_level(direction, c1.close, c2.close, mode)
         add(
             CheckResult(
                 "third_candle_rule",
@@ -115,64 +112,63 @@ class FinalValidator:
         )
         add(
             CheckResult(
-                "level_matches",
+                "level_consistency",
                 _prices_match(setup.level, level),
-                f"reported level {setup.level} != recomputed {level}",
+                f"setup level {setup.level} != recomputed {level}",
             )
         )
 
-        # --- rule 4: meaningful support/resistance ---------------------------
+        # --- rule 4: meaningful support/resistance --------------------------------
+        sr = setup.sr
         add(
             CheckResult(
-                "sr_type_allowed",
-                setup.sr_type in cfg.strategy.allowed_sr_types,
-                f"S/R type {setup.sr_type!r} is not an accepted level type",
+                "sr_present",
+                sr is not None,
+                "no meaningful S/R level near the pattern (middle of a range)",
             )
         )
-        side_ok = True
-        if direction is Direction.SHORT and setup.sr_type.endswith("_low"):
-            side_ok = False
-        if direction is Direction.LONG and setup.sr_type.endswith("_high"):
-            side_ok = False
-        add(
-            CheckResult(
-                "sr_side",
-                side_ok,
-                f"S/R type {setup.sr_type!r} is on the wrong side for {direction.value}",
+        if sr is not None:
+            required_side = "high" if direction is Direction.SHORT else "low"
+            add(
+                CheckResult(
+                    "sr_side",
+                    sr.side in (required_side, "any"),
+                    f"S/R level {sr.kind.value} is on the wrong side "
+                    f"for {direction.value}",
+                )
             )
-        )
-        add(
-            CheckResult(
-                "sr_proximity",
-                rules.sr_level_is_meaningful(
-                    level, setup.sr_level, cfg.strategy.sr_proximity_pct
-                ),
-                "pattern did not form at a meaningful S/R level "
-                f"(level {level}, S/R {setup.sr_level})",
+            add(
+                CheckResult(
+                    "sr_proximity",
+                    rules.sr_level_is_meaningful(
+                        level,
+                        sr.price,
+                        cfg.strategy.support_resistance.proximity_percent,
+                    ),
+                    "pattern did not form at a meaningful S/R level "
+                    f"(level {level}, S/R {sr.price})",
+                )
             )
-        )
 
-        # --- rule 5: candle 3 fully closed -----------------------------------
+        # --- rule 5: candle 3 fully closed, signal fresh ------------------------------
         now_ms = self._now_ms()
         close_ms = c3.close_time_ms(setup.timeframe_minutes)
-        closed = close_ms <= now_ms + cfg.app.clock_skew_seconds * 1000
         add(
             CheckResult(
                 "candle3_closed",
-                closed,
+                close_ms <= now_ms + cfg.scanner.clock_skew_seconds * 1000,
                 "candle 3 has not fully closed yet",
             )
         )
-        fresh = now_ms - close_ms <= cfg.app.max_alert_age_seconds * 1000
         add(
             CheckResult(
                 "signal_fresh",
-                fresh,
-                f"signal is older than {cfg.app.max_alert_age_seconds}s",
+                now_ms - close_ms <= cfg.scanner.max_signal_age_seconds * 1000,
+                f"signal is older than {cfg.scanner.max_signal_age_seconds}s",
             )
         )
 
-        # --- rules 6-8: entry / stop / targets --------------------------------
+        # --- rules 6-8: entry / stop / targets (recomputed cross-check) -------------
         levels = rules.compute_trade_levels(direction, c1, c2, c3)
         add(
             CheckResult(

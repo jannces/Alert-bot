@@ -1,10 +1,20 @@
-"""Tests for Telegram message formatting."""
+"""Tests for Telegram alert formatting."""
 
 from __future__ import annotations
 
-from strategy.models import Direction
+import pytest
+
+from config.settings import Settings
+from strategy.validation import FinalValidator
 from telegram.bot import build_alert_message, format_price
-from tests.fixtures import long_candles, make_short_setup
+from tests.fixtures import NOW_MS, make_long_setup, make_short_setup
+
+CHART_URL = "https://www.tradingview.com/chart/?symbol=MEXC%3ABTCUSDT.P&interval=15"
+
+
+@pytest.fixture()
+def validator() -> FinalValidator:
+    return FinalValidator(Settings(), now_ms=lambda: NOW_MS)
 
 
 class TestFormatPrice:
@@ -19,51 +29,62 @@ class TestFormatPrice:
 
 
 class TestAlertMessage:
-    def test_short_message_contains_all_required_fields(self):
+    def test_short_message_contains_all_required_fields(self, validator):
         setup = make_short_setup()
-        text = build_alert_message(setup, market="USDT Perpetual", screenshot_ok=True)
+        report = validator.validate(setup)
+        text = build_alert_message(setup, report, CHART_URL, screenshot_ok=True)
         for expected in (
             "TAMAD STRATEGY",
-            "MEXC",
-            "USDT Perpetual",
             "BTCUSDT",
             "SHORT",
             "15m",
             "109.5",  # entry
             "113",  # stop loss
-            "102.5",  # TP2
-            "99",  # TP3
+            "102.5",  # Take Profit 2R
+            "99",  # Take Profit 3R
             "1:2 / 1:3",
-            "Time Detected",
-            "Equal Closing Price",
-            "Third Candle respected Resistance",
-            "Candle 3 Closed",
+            "Detection Time",
         ):
             assert expected in text, f"missing {expected!r}"
 
-    def test_long_message_uses_support_wording(self):
-        c1, c2, c3 = long_candles()
-        setup = make_short_setup(
-            direction=Direction.LONG,
-            candle1=c1,
-            candle2=c2,
-            candle3=c3,
-            level=110.02,
-            sr_type="swing_low",
-            entry=110.5,
-            stop_loss=107.0,
-            tp2=117.5,
-            tp3=121.0,
-        )
-        text = build_alert_message(setup, market="USDT Perpetual", screenshot_ok=True)
-        assert "LONG" in text
-        assert "Support" in text
-        assert "Red Candle 1" in text
-        assert "Green Candle 2" in text
-
-    def test_missing_screenshot_adds_warning(self):
+    def test_validation_checklist_shows_seven_passing_rules(self, validator):
         setup = make_short_setup()
-        text = build_alert_message(setup, market="USDT Perpetual", screenshot_ok=False)
-        assert "⚠️" in text
-        ok_text = build_alert_message(setup, market="USDT Perpetual", screenshot_ok=True)
-        assert "⚠️" not in ok_text
+        text = build_alert_message(
+            setup, validator.validate(setup), CHART_URL, screenshot_ok=True
+        )
+        for label in (
+            "Candle 1 Color",
+            "Candle 2 Color",
+            "Candle 3 Rule",
+            "Equal Close",
+            "Support / Resistance",
+            "Stop Loss",
+            "Take Profit",
+        ):
+            assert f"✅ {label}" in text
+        assert "❌" not in text
+        assert "7 / 7 Rules Passed" in text
+
+    def test_tradingview_link_is_included(self, validator):
+        setup = make_short_setup()
+        text = build_alert_message(
+            setup, validator.validate(setup), CHART_URL, screenshot_ok=True
+        )
+        # HTML parse mode: the link appears as an anchor and as escaped text.
+        escaped = CHART_URL.replace("&", "&amp;")
+        assert f'<a href="{escaped}">' in text
+        assert f"\n{escaped}" in text
+
+    def test_long_message_direction(self, validator):
+        setup = make_long_setup()
+        text = build_alert_message(
+            setup, validator.validate(setup), CHART_URL, screenshot_ok=True
+        )
+        assert "LONG" in text
+        assert "7 / 7 Rules Passed" in text
+
+    def test_missing_screenshot_adds_warning(self, validator):
+        setup = make_short_setup()
+        report = validator.validate(setup)
+        assert "⚠️" in build_alert_message(setup, report, CHART_URL, screenshot_ok=False)
+        assert "⚠️" not in build_alert_message(setup, report, CHART_URL, screenshot_ok=True)

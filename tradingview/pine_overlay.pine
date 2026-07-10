@@ -1,0 +1,53 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// TAMAD VISUAL OVERLAY — display-only fallback (ARCHITECTURE.md §7, D1)
+//
+// ⚠ This indicator makes NO trading decisions and sends NO alerts.
+//
+// Signal detection and validation are performed 100% by the Python scanner.
+// The primary annotation path draws overlays onto the captured screenshot in
+// Python (Pillow). This script exists ONLY as an optional visual fallback:
+// if pixel calibration proves unreliable on your layout, add this indicator
+// to the saved TradingView layout so screenshots still show the pattern
+// marked natively. Anything it draws is cosmetic and never authoritative —
+// the numbers in the Telegram message are always the Python-validated ones.
+//
+// Keep the inputs identical to config/config.yaml so its cosmetic marks
+// coincide with Python's detections.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("Tamad Visual Overlay (display-only)", "TAMAD-VIS", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+tolerancePct   = input.float(0.05, "Equal Close Tolerance (%)", minval = 0.0, step = 0.01)
+comparisonMode = input.string("strict", "Comparison Mode", options = ["strict", "midpoint"])
+
+isGreen(int i) => close[i] > open[i]
+isRed(int i)   => close[i] < open[i]
+
+equalClose() => math.abs(close[2] - close[1]) <= close[2] * tolerancePct / 100.0
+
+patternLevel(bool isShort) =>
+    c1 = close[2]
+    c2 = close[1]
+    comparisonMode == "midpoint" ? (c1 + c2) / 2.0 :
+         isShort ? math.min(c1, c2) : math.max(c1, c2)
+
+shortPattern = isGreen(2) and isRed(1) and isGreen(0) and equalClose() and
+     close <= patternLevel(true)
+longPattern  = isRed(2) and isGreen(1) and isRed(0) and equalClose() and
+     close >= patternLevel(false)
+
+drawMark(bool isShort) =>
+    top = math.max(high, math.max(high[1], high[2]))
+    bot = math.min(low,  math.min(low[1],  low[2]))
+    box.new(bar_index - 2, top, bar_index, bot, xloc = xloc.bar_index,
+         border_color = color.orange, border_width = 2,
+         bgcolor = color.new(color.orange, 82))
+    lvl = patternLevel(isShort)
+    line.new(bar_index - 10, lvl, bar_index + 10, lvl, xloc = xloc.bar_index,
+         color = color.orange, width = 2)
+
+if barstate.isconfirmed and shortPattern
+    drawMark(true)
+if barstate.isconfirmed and longPattern
+    drawMark(false)

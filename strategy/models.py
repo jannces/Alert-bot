@@ -7,7 +7,7 @@ and validation layers stay pure and easy to test.
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 
@@ -18,26 +18,46 @@ class Direction(str, enum.Enum):
     SHORT = "SHORT"
 
 
-class SRType(str, enum.Enum):
-    """Kind of support/resistance level the pattern formed at."""
+class SRKind(str, enum.Enum):
+    """Kind of support/resistance level the pattern formed at.
+
+    ``swing_high``/``swing_low`` are implemented; the remaining kinds are
+    reserved for future detectors behind the same interface.
+    """
 
     SWING_HIGH = "swing_high"
     SWING_LOW = "swing_low"
     FRACTAL_HIGH = "fractal_high"
     FRACTAL_LOW = "fractal_low"
-    PREV_DAY_HIGH = "prev_day_high"
-    PREV_DAY_LOW = "prev_day_low"
-    PREV_WEEK_HIGH = "prev_week_high"
-    PREV_WEEK_LOW = "prev_week_low"
+    DAILY_HIGH = "daily_high"
+    DAILY_LOW = "daily_low"
+    WEEKLY_HIGH = "weekly_high"
+    WEEKLY_LOW = "weekly_low"
     PIVOT = "pivot"
+
+
+@dataclass(frozen=True, slots=True)
+class SRLevel:
+    """A confirmed structural support/resistance level."""
+
+    kind: SRKind
+    price: float
+
+    @property
+    def side(self) -> str:
+        """"high" for resistance-side levels, "low" for support-side."""
+        if self.kind.value.endswith("_high"):
+            return "high"
+        if self.kind.value.endswith("_low"):
+            return "low"
+        return "any"
 
 
 @dataclass(frozen=True, slots=True)
 class Candle:
     """A single fully-formed OHLC candle.
 
-    ``open_time_ms`` is the bar open time in milliseconds since epoch (the
-    same convention TradingView's ``time`` built-in uses).
+    ``open_time_ms`` is the bar open time in milliseconds since epoch.
     """
 
     open_time_ms: int
@@ -87,28 +107,31 @@ class TradeLevels:
 
 @dataclass(frozen=True, slots=True)
 class TamadSetup:
-    """A fully described Tamad setup as reported by TradingView.
+    """A fully described Tamad candidate produced by the Python scanner.
 
-    All numeric fields are re-validated by :mod:`strategy.validation` before
-    any notification is sent; nothing here is trusted as-is.
+    Built exclusively by :mod:`scanner.engine` from MEXC candle data, and
+    re-checked in full by :mod:`strategy.validation` before any notification.
+
+    ``sr`` is ``None`` when no meaningful S/R level was found near the
+    pattern — the validator rejects such candidates (and the rejection is
+    logged as a near-miss).
     """
 
     exchange: str
-    symbol: str  # TradingView ticker, e.g. "BTCUSDT.P"
+    symbol: str  # TradingView-style ticker, e.g. "BTCUSDT.P"
     timeframe_minutes: int
     direction: Direction
     candle1: Candle
     candle2: Candle
     candle3: Candle
     level: float  # support/resistance implied by the equal closes
-    sr_type: str  # reported S/R classification (see SRType)
-    sr_level: float  # the meaningful S/R level the pattern formed at
+    sr: SRLevel | None
     entry: float
     stop_loss: float
+    risk: float
     tp2: float
     tp3: float
     detected_at: datetime
-    raw_payload: dict = field(default_factory=dict)
 
     @property
     def candles(self) -> tuple[Candle, Candle, Candle]:
@@ -123,8 +146,7 @@ class TamadSetup:
     def timeframe_label(self) -> str:
         minutes = self.timeframe_minutes
         if minutes % 60 == 0:
-            hours = minutes // 60
-            return f"{hours}h"
+            return f"{minutes // 60}h"
         return f"{minutes}m"
 
     @property
@@ -163,6 +185,14 @@ class ValidationReport:
     @property
     def failed_checks(self) -> tuple[CheckResult, ...]:
         return tuple(check for check in self.checks if not check.passed)
+
+    @property
+    def passed_names(self) -> tuple[str, ...]:
+        return tuple(check.name for check in self.checks if check.passed)
+
+    @property
+    def failed_names(self) -> tuple[str, ...]:
+        return tuple(check.name for check in self.checks if not check.passed)
 
     def summary(self) -> str:
         if self.passed:

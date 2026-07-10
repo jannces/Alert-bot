@@ -1,9 +1,13 @@
-"""Asynchronous signal pipeline: validate → dedup → screenshot → notify.
+"""Per-signal pipeline: validate → dedup → screenshot → annotate → notify →
+persist.
 
-One background worker drains a queue of accepted webhook payloads so the
-webhook endpoint always responds within TradingView's delivery timeout. The
-worker is defensive end to end: any unexpected error is logged and the loop
-keeps running — a single bad alert can never take the scanner down.
+The scan engine hands over fully built candidates; this pipeline runs the
+final strict validation as the last gate, guards against duplicates, renders
+the annotated TradingView screenshot, delivers the Telegram alert, and
+records the complete signal snapshot (or the near-miss rejection).
+
+The pipeline is defensive end to end: any unexpected error is logged and
+contained — a single bad signal can never take the scanner down.
 """
 
 from __future__ import annotations
@@ -13,24 +17,24 @@ import logging
 
 from config.settings import Settings
 from database.repository import SignalRepository
-from screenshots.capture import ScreenshotProvider
+from screenshots.capture import ScreenshotService
 from strategy.models import TamadSetup
 from strategy.validation import FinalValidator
 from telegram.bot import TelegramNotifier, build_alert_message
-from tradingview.webhook_handler import AlertPayload
+from tradingview.links import chart_link
 
 logger = logging.getLogger(__name__)
 
 
 class SignalPipeline:
-    """Owns the alert queue and the full processing lifecycle of a signal."""
+    """Owns the full processing lifecycle of one detected candidate."""
 
     def __init__(
         self,
         settings: Settings,
         validator: FinalValidator,
         repository: SignalRepository,
-        screenshots: ScreenshotProvider,
+        screenshots: ScreenshotService,
         notifier: TelegramNotifier,
     ) -> None:
         self._settings = settings
@@ -38,157 +42,108 @@ class SignalPipeline:
         self._repository = repository
         self._screenshots = screenshots
         self._notifier = notifier
-        self._queue: asyncio.Queue[AlertPayload] = asyncio.Queue(maxsize=1000)
-        self._worker: asyncio.Task | None = None
-        self._processed = 0
-        self._sent = 0
-        self._rejected = 0
+        # Browser captures are serialized: one Chromium at a time.
+        self._capture_lock = asyncio.Lock()
+        self.processed = 0
+        self.sent = 0
+        self.rejected = 0
+        self.duplicates = 0
 
-    # -- lifecycle ------------------------------------------------------------
-
-    async def start(self) -> None:
-        self._worker = asyncio.create_task(self._run(), name="signal-pipeline")
-        logger.info("signal pipeline started")
-
-    async def stop(self) -> None:
-        if self._worker is not None:
-            self._worker.cancel()
-            try:
-                await self._worker
-            except asyncio.CancelledError:
-                pass
+    async def aclose(self) -> None:
         await self._screenshots.aclose()
         await self._notifier.aclose()
         self._repository.close()
-        logger.info("signal pipeline stopped")
 
     def stats(self) -> dict:
         return {
-            "queued": self._queue.qsize(),
-            "processed": self._processed,
-            "sent": self._sent,
-            "rejected": self._rejected,
+            "processed": self.processed,
+            "sent": self.sent,
+            "rejected": self.rejected,
+            "duplicates": self.duplicates,
         }
 
-    # -- ingestion --------------------------------------------------------------
+    async def process(self, setup: TamadSetup) -> None:
+        """Run one candidate through the complete pipeline. Never raises."""
+        self.processed += 1
+        try:
+            await self._process(setup)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one signal must never kill the scanner
+            logger.exception(
+                "unexpected error processing %s %s %s",
+                setup.direction.value,
+                setup.symbol,
+                setup.timeframe_label,
+            )
 
-    async def enqueue(self, payload: AlertPayload) -> None:
-        await self._queue.put(payload)
-
-    def record_malformed(self, data: object, error: str) -> None:
-        """Log a structurally invalid webhook payload for debugging."""
-        raw = data if isinstance(data, dict) else {"raw": str(data)[:2000]}
-        raw = {k: v for k, v in raw.items() if k != "secret"}
-        self._repository.record_rejection(
-            exchange=str(raw.get("exchange") or "") or None,
-            symbol=str(raw.get("symbol") or "") or None,
-            timeframe_minutes=None,
-            direction=str(raw.get("direction") or "") or None,
-            reasons=f"malformed payload: {error[:1000]}",
-            payload=raw,
-        )
-
-    # -- processing ---------------------------------------------------------------
-
-    async def _run(self) -> None:
-        while True:
-            payload = await self._queue.get()
-            try:
-                await self._process(payload)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - the worker must survive anything
-                logger.exception(
-                    "unexpected error processing %s %s alert",
-                    payload.symbol,
-                    payload.timeframe,
-                )
-            finally:
-                self._processed += 1
-                self._queue.task_done()
-
-    async def _process(self, payload: AlertPayload) -> None:
-        setup = payload.to_setup()
-
+    async def _process(self, setup: TamadSetup) -> None:
         # Final strict validation: every mandatory rule, recomputed from the
         # raw candle data. Any failure rejects the setup.
         report = self._validator.validate(setup)
         if not report.passed:
-            self._rejected += 1
-            reasons = report.summary()
+            self.rejected += 1
             logger.info(
                 "REJECTED %s %s %s: %s",
                 setup.direction.value,
-                setup.symbol,
+                setup.pair,
                 setup.timeframe_label,
-                reasons,
+                report.summary(),
             )
-            self._repository.record_rejection(
-                exchange=setup.exchange,
-                symbol=setup.symbol,
-                timeframe_minutes=setup.timeframe_minutes,
-                direction=setup.direction.value,
-                reasons=reasons,
-                payload=setup.raw_payload,
-            )
+            self._repository.record_rejection(setup, report)
             return
 
         # Duplicate guard: the key is claimed atomically before sending, so a
         # setup can be alerted at most once — ever, across restarts.
-        if not self._repository.reserve_signal(setup):
+        if not self._repository.reserve_signal(setup, report):
+            self.duplicates += 1
             logger.info(
                 "duplicate suppressed: %s %s %s (candle %d)",
                 setup.direction.value,
-                setup.symbol,
+                setup.pair,
                 setup.timeframe_label,
                 setup.candle3.open_time_ms,
             )
             return
 
-        await self._send(setup)
+        async with self._capture_lock:
+            shot = await self._screenshots.render(setup)
 
-    async def _send(self, setup: TamadSetup) -> None:
-        tv_symbol = f"{self._settings.exchange.tv_prefix}:{setup.symbol}"
-        screenshot = await self._screenshots.capture(tv_symbol, setup.tv_interval)
-
-        if screenshot is None:
-            if self._settings.screenshots.on_failure == "skip_alert":
-                logger.error(
-                    "screenshot failed and on_failure=skip_alert: "
-                    "NOT alerting %s %s %s",
-                    setup.direction.value,
-                    setup.symbol,
-                    setup.timeframe_label,
-                )
-                self._repository.release_signal(setup.dedup_key)
-                self._repository.record_rejection(
-                    exchange=setup.exchange,
-                    symbol=setup.symbol,
-                    timeframe_minutes=setup.timeframe_minutes,
-                    direction=setup.direction.value,
-                    reasons="screenshot capture failed (on_failure=skip_alert)",
-                    payload=setup.raw_payload,
-                )
-                return
+        if shot is None and self._settings.screenshots.on_failure == "skip_alert":
+            logger.error(
+                "screenshot failed and on_failure=skip_alert: NOT alerting %s %s %s",
+                setup.direction.value,
+                setup.pair,
+                setup.timeframe_label,
+            )
+            self._repository.release_signal(setup.dedup_key)
+            self._repository.record_rejection(setup, report)
+            return
+        if shot is None:
             logger.warning(
-                "screenshot failed for %s; sending text-only alert", setup.symbol
+                "screenshot failed for %s; sending text-only alert", setup.pair
             )
 
         message = build_alert_message(
             setup,
-            market=self._settings.exchange.market,
-            screenshot_ok=screenshot is not None,
+            report,
+            chart_link(setup, self._settings.exchange.tv_prefix),
+            screenshot_ok=shot is not None,
         )
-        sent = await self._notifier.send_alert(message, screenshot)
-        if sent:
-            self._sent += 1
+        delivered = await self._notifier.send_alert(
+            message, shot.image if shot else None
+        )
+        if delivered:
+            self.sent += 1
             self._repository.mark_sent(
-                setup.dedup_key, screenshot_attached=screenshot is not None
+                setup.dedup_key,
+                screenshot_path=shot.file_path if shot else None,
+                screenshot_attached=shot is not None,
             )
             logger.info(
                 "ALERT SENT: %s %s %s entry=%s sl=%s tp2=%s tp3=%s",
                 setup.direction.value,
-                setup.symbol,
+                setup.pair,
                 setup.timeframe_label,
                 setup.entry,
                 setup.stop_loss,
@@ -196,12 +151,13 @@ class SignalPipeline:
                 setup.tp3,
             )
         else:
-            # Telegram is down: release the reservation so the operator can
-            # replay the webhook without the dedup guard swallowing it.
+            # Telegram is down: release the reservation so the signal is not
+            # silently swallowed (a later re-detection of the same bar could
+            # still deliver it within the freshness window).
             self._repository.release_signal(setup.dedup_key)
             logger.error(
                 "Telegram delivery failed for %s %s %s; reservation released",
                 setup.direction.value,
-                setup.symbol,
+                setup.pair,
                 setup.timeframe_label,
             )

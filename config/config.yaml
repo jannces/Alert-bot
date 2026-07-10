@@ -1,62 +1,67 @@
-# Tamad Strategy scanner configuration.
+# Tamad Strategy scanner configuration (v2 — Python-only detection).
 #
 # Any string may reference environment variables with ${VAR}. Keep secrets
-# (tokens, webhook secret) in the environment / .env — never in this file.
+# (tokens) in the environment / .env — never in this file.
 
 app:
   host: 0.0.0.0
-  port: 8080
-  # Shared secret that every TradingView alert must carry. Must match the
-  # "Webhook Secret" input of the Pine script. The scanner refuses to start
-  # when this is empty.
-  webhook_secret: ${WEBHOOK_SECRET}
-  # Reject signals whose third candle closed longer ago than this — a stale
-  # alert (e.g. delayed webhook delivery) is not tradeable.
-  max_alert_age_seconds: 600
-  # Allowance for clock drift between TradingView and this host when
-  # confirming that candle 3 has fully closed.
-  clock_skew_seconds: 30
+  port: 8080            # /health endpoint only
 
 exchange:
   name: MEXC
-  tv_prefix: MEXC          # TradingView exchange prefix (MEXC:BTCUSDT.P)
+  tv_prefix: MEXC       # TradingView exchange prefix (MEXC:BTCUSDT.P)
   market: USDT Perpetual
-  symbol_suffix: USDT.P    # only USDT perpetual contracts are accepted
 
 scanner:
-  # TradingView interval strings, in minutes. Alerts on any other timeframe
-  # are rejected.
+  # Timeframes in minutes. A sweep runs whenever a candle of any of these
+  # timeframes closes.
   timeframes: ["15", "30", "60"]
   symbols:
-    mode: all              # all | whitelist
-    whitelist: []          # e.g. ["BTCUSDT.P", "ETHUSDT.P"] when mode: whitelist
+    mode: all           # all | whitelist
+    whitelist: []       # e.g. ["BTCUSDT.P", "ETHUSDT.P"] when mode: whitelist
+  # Candles fetched per (symbol, timeframe): S/R context + pattern candles.
+  # Keep >= left_bars + right_bars + 10.
+  history_bars: 150
+  # Wait after a candle-close boundary before sweeping, so MEXC has
+  # published the final candle.
+  boundary_settle_seconds: 5
+  # Reject setups whose candle 3 closed longer ago than this — a stale
+  # signal is not tradeable. Must comfortably exceed the sweep duration.
+  max_signal_age_seconds: 600
+  # Allowance for clock drift when confirming candle 3 has fully closed.
+  clock_skew_seconds: 30
+  # How often the active-contract list is refreshed.
+  symbol_refresh_seconds: 3600
+
+mexc:
+  base_url: https://contract.mexc.com
+  # Token bucket for the public market-data endpoints; keep conservative
+  # (MEXC allows roughly 20 requests / 2 s per IP).
+  requests_per_second: 8
+  max_concurrency: 8
+  retries: 3
+  timeout_seconds: 15
 
 strategy:
-  # Maximum difference between candle 1 and candle 2 closes, in percent.
-  equal_close_tolerance_pct: 0.05
-  # How the exact level is derived from the two near-equal closes:
-  #   strict — the close candle 3 is least allowed to break (default;
-  #            when in doubt, reject)
-  #   outer  — the more permissive of the two closes
-  #   avg    — midpoint of the two closes
-  # Must match the "Level Basis" input of the Pine script.
-  level_basis: strict
-  # Bars on each side required to confirm a swing/pivot in the Pine script.
-  swing_lookback: 10
-  # Maximum distance between the pattern level and the structural S/R level,
-  # in percent — patterns further from meaningful S/R are rejected.
-  sr_proximity_pct: 0.15
-  # S/R classifications accepted from TradingView.
-  allowed_sr_types:
-    - swing_high
-    - swing_low
-    - fractal_high
-    - fractal_low
-    - prev_day_high
-    - prev_day_low
-    - prev_week_high
-    - prev_week_low
-    - pivot
+  equal_close:
+    # Max difference between candle 1 and candle 2 closes, in percent.
+    tolerance_percent: 0.05
+    # How the exact level is derived from the two near-equal closes:
+    #   strict   — the close candle 3 is least allowed to break (default;
+    #              when in doubt, reject)
+    #   midpoint — midpoint of the two closes
+    # ("average" is intentionally not offered: with two candles it equals
+    #  the midpoint — see ARCHITECTURE.md, decision D2.)
+    comparison_mode: strict
+  support_resistance:
+    # Only swing_high_low is implemented; fractals, daily/weekly high-low
+    # and pivots plug in behind the same interface later.
+    method: swing_high_low
+    left_bars: 20        # bars left of a swing that it must exceed
+    right_bars: 20       # bars right of a swing (confirmation lag)
+    # Pattern level must sit within this % of a confirmed S/R level;
+    # middle-of-range patterns are rejected.
+    proximity_percent: 0.25
   # R multiples for the displayed targets (TP2 = 2R, TP3 = 3R).
   risk_reward_targets: [2.0, 3.0]
 
@@ -67,18 +72,23 @@ telegram:
   timeout_seconds: 30
 
 screenshots:
-  # playwright — headless Chromium screenshot of your TradingView layout
-  # chart_img  — chart-img.com snapshot API (api key required)
-  # disabled   — no screenshots (alerts flag the missing chart)
-  provider: playwright
-  # What to do when the screenshot cannot be captured:
+  provider: playwright             # playwright | disabled
+  # python_overlay — Pillow-drawn highlights/levels/legend (default;
+  #                  auto-degrades to legend-only when pixel calibration
+  #                  fails on a capture)
+  # legend_only    — clean chart + legend panel with all trade details
+  # none           — raw chart screenshot
+  annotations: python_overlay
+  # What to do when the screenshot cannot be captured at all:
   #   send_without_image — deliver the alert with a warning line
   #   skip_alert         — do not alert at all (strictest)
   on_failure: send_without_image
+  # Annotated PNGs are persisted here; the path is stored with each signal.
+  output_dir: screenshots/out
   playwright:
-    # Point this at YOUR saved TradingView chart layout that has the Tamad
-    # indicator applied, e.g. https://www.tradingview.com/chart/AbCdEfGh/
-    # The indicator draws the highlighted candles, S/R, entry, SL, TP2, TP3.
+    # Point this at YOUR saved TradingView chart layout, e.g.
+    # https://www.tradingview.com/chart/AbCdEfGh/  — symbol and interval are
+    # switched via URL parameters, your saved appearance is kept.
     chart_url: https://www.tradingview.com/chart/
     # Playwright storage state exported after logging in to TradingView
     # (required for private layouts; see README).
@@ -87,14 +97,8 @@ screenshots:
     executable_path: ""
     viewport: { width: 1600, height: 900 }
     render_wait_seconds: 6
-    timeout_seconds: 45
+    timeout_seconds: 60
     retries: 2
-  chart_img:
-    api_key: ${CHART_IMG_API_KEY}
-    base_url: https://api.chart-img.com/v2/tradingview/advanced-chart
-    width: 1200
-    height: 675
-    timeout_seconds: 30
 
 database:
   path: database/tamad.sqlite3

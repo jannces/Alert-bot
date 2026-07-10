@@ -6,21 +6,23 @@ import pytest
 
 from config.settings import Settings
 from database.repository import SignalRepository
-from screenshots.capture import ScreenshotProvider
+from screenshots.capture import RenderedScreenshot
 from strategy.pipeline import SignalPipeline
 from strategy.validation import FinalValidator
-from tradingview.webhook_handler import AlertPayload
-from tests.fixtures import NOW_MS, short_payload_dict
+from tests.fixtures import NOW_MS, make_short_setup
 
 
-class ScreenshotStub(ScreenshotProvider):
-    def __init__(self, image: bytes | None) -> None:
-        self.image = image
-        self.calls: list[tuple[str, str]] = []
+class ScreenshotServiceStub:
+    def __init__(self, shot: RenderedScreenshot | None) -> None:
+        self.shot = shot
+        self.calls = 0
 
-    async def capture(self, tv_symbol: str, interval: str) -> bytes | None:
-        self.calls.append((tv_symbol, interval))
-        return self.image
+    async def render(self, setup) -> RenderedScreenshot | None:
+        self.calls += 1
+        return self.shot
+
+    async def aclose(self) -> None:
+        return None
 
 
 class NotifierStub:
@@ -36,12 +38,17 @@ class NotifierStub:
         return None
 
 
-def make_pipeline(tmp_path, *, image: bytes | None = b"png", notifier_ok: bool = True,
-                  on_failure: str = "send_without_image"):
+def make_pipeline(
+    tmp_path,
+    *,
+    shot: RenderedScreenshot | None = RenderedScreenshot(b"png", "out/x.png"),
+    notifier_ok: bool = True,
+    on_failure: str = "send_without_image",
+):
     settings = Settings()
     settings.screenshots.on_failure = on_failure
     repo = SignalRepository(tmp_path / "pipeline.sqlite3")
-    screenshots = ScreenshotStub(image)
+    screenshots = ScreenshotServiceStub(shot)
     notifier = NotifierStub(notifier_ok)
     pipeline = SignalPipeline(
         settings=settings,
@@ -53,48 +60,46 @@ def make_pipeline(tmp_path, *, image: bytes | None = b"png", notifier_ok: bool =
     return pipeline, repo, screenshots, notifier
 
 
-def payload() -> AlertPayload:
-    return AlertPayload.model_validate(short_payload_dict())
-
-
 @pytest.mark.asyncio
 async def test_valid_setup_sends_one_alert_with_screenshot(tmp_path):
     pipeline, repo, screenshots, notifier = make_pipeline(tmp_path)
-    await pipeline._process(payload())
+    await pipeline.process(make_short_setup())
 
-    assert screenshots.calls == [("MEXC:BTCUSDT.P", "15")]
+    assert screenshots.calls == 1
     assert len(notifier.sent) == 1
     text, image = notifier.sent[0]
     assert "TAMAD STRATEGY" in text and image == b"png"
     assert repo.sent_signal_count() == 1
+    row = repo._conn.execute("SELECT screenshot_path FROM signals").fetchone()
+    assert row[0] == "out/x.png"
 
 
 @pytest.mark.asyncio
 async def test_duplicate_alert_is_suppressed(tmp_path):
     pipeline, repo, _, notifier = make_pipeline(tmp_path)
-    await pipeline._process(payload())
-    await pipeline._process(payload())
+    await pipeline.process(make_short_setup())
+    await pipeline.process(make_short_setup())
 
     assert len(notifier.sent) == 1
     assert repo.sent_signal_count() == 1
+    assert pipeline.duplicates == 1
 
 
 @pytest.mark.asyncio
 async def test_invalid_setup_is_rejected_and_logged(tmp_path):
-    pipeline, repo, _, notifier = make_pipeline(tmp_path)
-    bad = short_payload_dict()
-    bad["tp2"] = 100.0  # tampered target — recomputation must catch it
-    await pipeline._process(AlertPayload.model_validate(bad))
+    pipeline, repo, screenshots, notifier = make_pipeline(tmp_path)
+    await pipeline.process(make_short_setup(sr=None))  # middle of a range
 
     assert not notifier.sent
+    assert screenshots.calls == 0  # rejected before any capture
     assert repo.rejection_count() == 1
     assert repo.sent_signal_count() == 0
 
 
 @pytest.mark.asyncio
 async def test_screenshot_failure_sends_text_alert_by_default(tmp_path):
-    pipeline, _, _, notifier = make_pipeline(tmp_path, image=None)
-    await pipeline._process(payload())
+    pipeline, _, _, notifier = make_pipeline(tmp_path, shot=None)
+    await pipeline.process(make_short_setup())
 
     assert len(notifier.sent) == 1
     text, image = notifier.sent[0]
@@ -105,9 +110,9 @@ async def test_screenshot_failure_sends_text_alert_by_default(tmp_path):
 @pytest.mark.asyncio
 async def test_screenshot_failure_skips_alert_in_strict_mode(tmp_path):
     pipeline, repo, _, notifier = make_pipeline(
-        tmp_path, image=None, on_failure="skip_alert"
+        tmp_path, shot=None, on_failure="skip_alert"
     )
-    await pipeline._process(payload())
+    await pipeline.process(make_short_setup())
 
     assert not notifier.sent
     assert repo.sent_signal_count() == 0
@@ -117,10 +122,10 @@ async def test_screenshot_failure_skips_alert_in_strict_mode(tmp_path):
 @pytest.mark.asyncio
 async def test_telegram_failure_releases_reservation(tmp_path):
     pipeline, repo, _, notifier = make_pipeline(tmp_path, notifier_ok=False)
-    await pipeline._process(payload())
+    await pipeline.process(make_short_setup())
     assert repo.sent_signal_count() == 0
 
-    # A replayed webhook can retry after the failure.
+    # A later retry of the same signal can still deliver it.
     notifier.ok = True
-    await pipeline._process(payload())
+    await pipeline.process(make_short_setup())
     assert repo.sent_signal_count() == 1

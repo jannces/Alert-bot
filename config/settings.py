@@ -2,8 +2,8 @@
 
 Configuration lives in ``config/config.yaml``. Any string value may contain
 ``${ENV_VAR}`` placeholders, which are substituted from the process
-environment at load time — secrets (Telegram token, webhook secret) should
-always come from the environment, never be committed to the YAML file.
+environment at load time — secrets (Telegram token) should always come from
+the environment, never be committed to the YAML file.
 """
 
 from __future__ import annotations
@@ -33,16 +33,12 @@ def _expand_env(value: object) -> object:
 class AppSettings(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
-    webhook_secret: str = ""
-    max_alert_age_seconds: int = 600
-    clock_skew_seconds: int = 30
 
 
 class ExchangeSettings(BaseModel):
     name: str = "MEXC"
     tv_prefix: str = "MEXC"
     market: str = "USDT Perpetual"
-    symbol_suffix: str = "USDT.P"
 
 
 class SymbolsSettings(BaseModel):
@@ -58,6 +54,11 @@ class SymbolsSettings(BaseModel):
 class ScannerSettings(BaseModel):
     timeframes: list[str] = Field(default_factory=lambda: ["15", "30", "60"])
     symbols: SymbolsSettings = Field(default_factory=SymbolsSettings)
+    history_bars: int = Field(default=150, ge=50, le=2000)
+    boundary_settle_seconds: float = 5.0
+    max_signal_age_seconds: int = 600
+    clock_skew_seconds: int = 30
+    symbol_refresh_seconds: int = 3600
 
     @field_validator("timeframes")
     @classmethod
@@ -68,27 +69,36 @@ class ScannerSettings(BaseModel):
         return v
 
     @property
-    def timeframe_minutes(self) -> set[int]:
-        return {int(tf) for tf in self.timeframes}
+    def timeframe_minutes(self) -> list[int]:
+        return sorted(int(tf) for tf in self.timeframes)
+
+
+class MexcSettings(BaseModel):
+    base_url: str = "https://contract.mexc.com"
+    requests_per_second: float = Field(default=8.0, gt=0)
+    max_concurrency: int = Field(default=8, ge=1)
+    retries: int = Field(default=3, ge=0)
+    timeout_seconds: float = 15.0
+
+
+class EqualCloseSettings(BaseModel):
+    tolerance_percent: float = Field(default=0.05, ge=0)
+    # "average" is intentionally not offered: with two candles it is
+    # mathematically identical to "midpoint" (see ARCHITECTURE.md, D2).
+    comparison_mode: Literal["strict", "midpoint"] = "strict"
+
+
+class SupportResistanceSettings(BaseModel):
+    method: Literal["swing_high_low"] = "swing_high_low"
+    left_bars: int = Field(default=20, ge=1)
+    right_bars: int = Field(default=20, ge=1)
+    proximity_percent: float = Field(default=0.25, gt=0)
 
 
 class StrategySettings(BaseModel):
-    equal_close_tolerance_pct: float = 0.05
-    level_basis: Literal["strict", "outer", "avg"] = "strict"
-    swing_lookback: int = 10
-    sr_proximity_pct: float = 0.15
-    allowed_sr_types: list[str] = Field(
-        default_factory=lambda: [
-            "swing_high",
-            "swing_low",
-            "fractal_high",
-            "fractal_low",
-            "prev_day_high",
-            "prev_day_low",
-            "prev_week_high",
-            "prev_week_low",
-            "pivot",
-        ]
+    equal_close: EqualCloseSettings = Field(default_factory=EqualCloseSettings)
+    support_resistance: SupportResistanceSettings = Field(
+        default_factory=SupportResistanceSettings
     )
     risk_reward_targets: list[float] = Field(default_factory=lambda: [2.0, 3.0])
 
@@ -111,23 +121,16 @@ class PlaywrightSettings(BaseModel):
     executable_path: str = ""
     viewport: ViewportSettings = Field(default_factory=ViewportSettings)
     render_wait_seconds: float = 6.0
-    timeout_seconds: float = 45.0
+    timeout_seconds: float = 60.0
     retries: int = 2
 
 
-class ChartImgSettings(BaseModel):
-    api_key: str = ""
-    base_url: str = "https://api.chart-img.com/v2/tradingview/advanced-chart"
-    width: int = 1200
-    height: int = 675
-    timeout_seconds: float = 30.0
-
-
 class ScreenshotSettings(BaseModel):
-    provider: Literal["playwright", "chart_img", "disabled"] = "playwright"
+    provider: Literal["playwright", "disabled"] = "playwright"
+    annotations: Literal["python_overlay", "legend_only", "none"] = "python_overlay"
     on_failure: Literal["send_without_image", "skip_alert"] = "send_without_image"
+    output_dir: str = "screenshots/out"
     playwright: PlaywrightSettings = Field(default_factory=PlaywrightSettings)
-    chart_img: ChartImgSettings = Field(default_factory=ChartImgSettings)
 
 
 class DatabaseSettings(BaseModel):
@@ -145,6 +148,7 @@ class Settings(BaseModel):
     app: AppSettings = Field(default_factory=AppSettings)
     exchange: ExchangeSettings = Field(default_factory=ExchangeSettings)
     scanner: ScannerSettings = Field(default_factory=ScannerSettings)
+    mexc: MexcSettings = Field(default_factory=MexcSettings)
     strategy: StrategySettings = Field(default_factory=StrategySettings)
     telegram: TelegramSettings = Field(default_factory=TelegramSettings)
     screenshots: ScreenshotSettings = Field(default_factory=ScreenshotSettings)

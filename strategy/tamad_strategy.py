@@ -1,7 +1,7 @@
 """Pure implementation of the Tamad Strategy pattern rules.
 
 The Tamad Strategy is a strict three-candle rejection pattern that must form
-at a meaningful support or resistance level:
+at a meaningful support or resistance area:
 
 SHORT
     Candle 1: green (bullish)
@@ -15,44 +15,45 @@ LONG
     Exact mirror image (red / green / red, equal closes form the support,
     Candle 3 must not close below it, stop is the lowest low).
 
-Entry is always the close of Candle 3. TP2/TP3 are 2R and 3R from entry.
-No indicators, ATR, or percentages are ever used for the stop.
+Entry is always the close of Candle 3 — never the next candle's open, never
+market price, never a midpoint. TP2/TP3 are 2R and 3R from entry. No
+indicators, ATR, percentages, or volatility are ever used for the stop.
 
-This module is deliberately side-effect free so the exact same code path is
-used by the final pre-alert validation and by the unit tests.
+This module is the single source of truth for the pattern: the scan engine
+detects with it and the final pre-alert validation re-checks with it.
 """
 
 from __future__ import annotations
 
 import enum
-from typing import Sequence
 
 from strategy.models import Candle, Direction, TradeLevels
 
 
-class LevelBasis(str, enum.Enum):
+class ComparisonMode(str, enum.Enum):
     """How the pattern level is derived from the two (near-)equal closes.
 
     The two closes only match within a tolerance, so a rule is needed to pick
     the exact level Candle 3 is compared against:
 
-    - ``STRICT``: the level Candle 3 is *least* allowed to break — the lower
-      of the two closes for a SHORT, the higher for a LONG. This is the
-      default: when in doubt, reject.
-    - ``OUTER``: the more permissive of the two closes.
-    - ``AVG``: the midpoint of the two closes.
+    - ``STRICT`` (default): the close Candle 3 is *least* allowed to break —
+      the lower of the two closes for a SHORT, the higher for a LONG.
+      When in doubt, reject.
+    - ``MIDPOINT``: the midpoint of the two closes.
+
+    An ``average`` mode was deliberately NOT added: with exactly two
+    reference candles the arithmetic mean of the closes is identical to the
+    midpoint, and two config names for one behavior invite confusion.
     """
 
     STRICT = "strict"
-    OUTER = "outer"
-    AVG = "avg"
+    MIDPOINT = "midpoint"
 
 
 def equal_close(close1: float, close2: float, tolerance_pct: float) -> bool:
     """True when the two closes match within ``tolerance_pct`` percent.
 
-    The tolerance is measured relative to Candle 1's close, mirroring the
-    Pine Script implementation exactly.
+    The tolerance is measured relative to Candle 1's close.
     """
     if close1 <= 0 or close2 <= 0:
         return False
@@ -60,16 +61,16 @@ def equal_close(close1: float, close2: float, tolerance_pct: float) -> bool:
 
 
 def pattern_level(
-    direction: Direction, close1: float, close2: float, basis: LevelBasis
+    direction: Direction, close1: float, close2: float, mode: ComparisonMode
 ) -> float:
     """The support/resistance level implied by the two equal closes."""
-    if basis is LevelBasis.AVG:
+    if mode is ComparisonMode.MIDPOINT:
         return (close1 + close2) / 2.0
     if direction is Direction.SHORT:
-        # Resistance. STRICT = lower close (hardest to satisfy).
-        return min(close1, close2) if basis is LevelBasis.STRICT else max(close1, close2)
-    # Support. STRICT = higher close (hardest to satisfy).
-    return max(close1, close2) if basis is LevelBasis.STRICT else min(close1, close2)
+        # Resistance: the lower close is the level hardest to satisfy.
+        return min(close1, close2)
+    # Support: the higher close is the level hardest to satisfy.
+    return max(close1, close2)
 
 
 def candle_colors_valid(direction: Direction, c1: Candle, c2: Candle, c3: Candle) -> bool:
@@ -92,7 +93,7 @@ def compute_trade_levels(
     """Derive entry / stop / targets strictly from the three pattern candles.
 
     Entry is Candle 3's close. The stop is the extreme wick of the three
-    candles — never ATR, percentages, or indicators.
+    candles. Risk = |entry − stop|; TP2 = 2R, TP3 = 3R.
     """
     entry = c3.close
     if direction is Direction.SHORT:
@@ -108,50 +109,33 @@ def compute_trade_levels(
     return TradeLevels(entry=entry, stop_loss=stop_loss, risk=risk, tp2=tp2, tp3=tp3)
 
 
-def detect_pattern(
-    candles: Sequence[Candle],
-    tolerance_pct: float,
-    basis: LevelBasis = LevelBasis.STRICT,
-) -> tuple[Direction, float, TradeLevels] | None:
-    """Detect a Tamad pattern on the last three candles of ``candles``.
+def matches_prefilter(
+    c1: Candle, c2: Candle, c3: Candle, tolerance_pct: float
+) -> Direction | None:
+    """The candidate pre-filter: candle colors + equal close.
 
-    All candles supplied must already be fully closed — this function never
-    sees, and must never be given, a forming candle.
-
-    Returns ``(direction, level, trade_levels)`` for a valid pattern, or
-    ``None`` when no rule-perfect pattern exists. The meaningful-S/R filter
-    is applied separately (it needs broader market context than three bars).
+    This is the boundary for near-miss rejection logging: bars that fail
+    this filter are simply "no pattern" and are never persisted; bars that
+    pass become candidates, and any later rule failure is a logged rejection.
     """
-    if len(candles) < 3:
-        return None
-    c1, c2, c3 = candles[-3], candles[-2], candles[-1]
-
     if not (c1.is_sane() and c2.is_sane() and c3.is_sane()):
         return None
     if not equal_close(c1.close, c2.close, tolerance_pct):
         return None
-
     for direction in (Direction.SHORT, Direction.LONG):
-        if not candle_colors_valid(direction, c1, c2, c3):
-            continue
-        level = pattern_level(direction, c1.close, c2.close, basis)
-        if not third_candle_respects_level(direction, c3, level):
-            return None  # colors matched but the third-candle rule failed
-        levels = compute_trade_levels(direction, c1, c2, c3)
-        if levels.risk <= 0:
-            return None
-        return direction, level, levels
+        if candle_colors_valid(direction, c1, c2, c3):
+            return direction
     return None
 
 
 def sr_level_is_meaningful(
-    pattern_lvl: float, sr_level: float, proximity_pct: float
+    pattern_lvl: float, sr_price: float, proximity_pct: float
 ) -> bool:
-    """True when the reported S/R level sits close enough to the pattern.
+    """True when the structural S/R level sits close enough to the pattern.
 
     ``proximity_pct`` is the maximum distance between the pattern level and
     the structural S/R level, as a percentage of the pattern level.
     """
-    if pattern_lvl <= 0 or sr_level <= 0:
+    if pattern_lvl <= 0 or sr_price <= 0:
         return False
-    return abs(sr_level - pattern_lvl) <= pattern_lvl * proximity_pct / 100.0
+    return abs(sr_price - pattern_lvl) <= pattern_lvl * proximity_pct / 100.0

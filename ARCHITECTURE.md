@@ -1,303 +1,221 @@
-# Tamad Strategy Scanner — Revised Architecture (v2)
+# Tamad Strategy Scanner — Architecture (v2)
 
-**Status: PROPOSED — awaiting review. No implementation has started.**
+**Status: APPROVED — decisions D1–D4 resolved by the project owner; this
+document is the implementation reference.**
 
-This document describes the revision from the v1 design (TradingView detects,
-Python validates) to the v2 design (Python detects everything, TradingView is
-display-only). It also lists the technical limitations found during design —
-especially around Playwright-driven TradingView screenshots — and the
-practical alternatives where a requirement cannot be met reliably.
+Python is the single source of truth for all market scanning, strategy
+detection, and validation. TradingView is strictly a charting and screenshot
+service. The scanner never trades: no order placement, no position
+management, no exchange credentials — it reads public market data and writes
+Telegram messages, log lines, and database rows. Nothing else.
 
 ---
 
-## 1. Principles (unchanged)
+## 1. Decision record
 
-- **Never trades.** No order placement, no position management, no account
-  credentials. The scanner reads public market data and writes Telegram
-  messages, log lines, and database rows. Nothing else.
-- **Accuracy over quantity.** Every rule is mandatory. Any failed rule
-  rejects the setup. When in doubt, reject.
-- **Only fully closed candles.** A setup is evaluated only after Candle 3 has
-  completely closed.
+| # | Decision |
+|---|---|
+| **D1** | Screenshots come from Playwright driving the owner's saved TradingView layout. All annotations (3-candle highlight, S/R, entry, SL, TP2, TP3, legend) are drawn **by Python (Pillow) onto the captured image**, so they always match the Python-validated signal. Pine overlays are **not** used for strategy visualization; a display-only Pine overlay remains available solely as a documented fallback if pixel calibration proves unreliable in the field (§7). |
+| **D2** | `comparison_mode` supports only `strict` (default) and `midpoint`. **`average` was removed** because with exactly two reference candles the arithmetic mean of the two closes *is* the midpoint — two names for one behavior invite config confusion without adding capability. |
+| **D3** | Rejections are logged **only for near-miss candidates**: setups that passed the pattern pre-filter (candle colors + equal close) but failed one or more later rules. Each rejection stores pair, timeframe, detection time, rules passed, rules failed, OHLC of all three candles, and the failure reason. Plain "no pattern on this bar" is never persisted. |
+| **D4** | The v1 TradingView-detection architecture is **deleted**: the detection Pine script, the webhook endpoint, and all webhook-payload handling. Git history preserves them. Only a minimal `/health` endpoint remains for monitoring. |
 
-## 2. What changes vs v1
-
-| Concern | v1 (current code) | v2 (this proposal) |
-|---|---|---|
-| Candle data | TradingView (via webhook payload) | **MEXC public futures API** (read-only, no API key) |
-| Pattern detection | Pine Script v6 | **100% Python** |
-| S/R detection | Pine Script | **100% Python** (configurable methods) |
-| Trigger | TradingView alert webhooks (one alert per symbol/TF, plan-limited) | **Python scheduler on candle close** — scans *every* active USDT perp with no TradingView plan limits |
-| Entry/SL/TP | Pine computes, Python re-validates | **Python computes** (single source of truth) |
-| TradingView's role | Detection + chart + webhook | **Chart visualization + screenshot only** |
-| Webhook server | FastAPI `/webhook/tradingview` | **Removed.** Only `/health` remains for monitoring |
-
-Removing the webhook dependency also removes the v1 architecture's biggest
-practical constraint: TradingView cannot natively scan "all MEXC USDT perps"
-— it needed one configured alert per symbol per timeframe. In v2, Python
-discovers and scans every active contract itself.
-
-## 3. Revised workflow
+## 2. Pipeline (authoritative)
 
 ```
-                     ┌──────────────────────────────────────────────┐
-                     │ every 15m / 30m / 1h candle-close boundary   │
-                     └──────────────────────┬───────────────────────┘
-                                            ▼
-MEXC public API ──► Symbol discovery (all active USDT perpetuals, refreshed hourly)
+MEXC Futures API                 public read-only endpoints; no API key
         │
         ▼
-Python Scanner ──── rate-limited async sweep: fetch last N closed candles
-        │           per (symbol, timeframe); forming candle discarded;
-        │           already-processed bars skipped
+Async Python Scanner             candle-close scheduler + rate-limited sweep
+        │                        over every active USDT perpetual
         ▼
-Tamad Strategy Validation ── candle colors, equal close, third-candle rule,
-        │                    S/R detection + proximity, sanity checks
+Tamad Strategy Validation        colors, equal close, third-candle rule —
+        │                        pure Python, only fully closed candles
         ▼
-Duplicate Check ──── SQLite, atomic claim, survives restarts
+Support/Resistance Validation    configurable detector (swing high/low first);
+        │                        middle-of-range patterns rejected
+        ▼
+Risk Management Calculation      Entry = Candle 3 close · SL = extreme wick
+        │                        of the 3 candles · Risk = |Entry − SL| ·
+        │                        TP2 = 2R · TP3 = 3R
+        ▼
+Duplicate Check                  SQLite atomic claim; survives restarts
         │
         ▼
-Generate Trade Details ── Entry = Candle 3 close
-        │                 SL = extreme wick of the 3 candles
-        │                 Risk = |Entry − SL|; TP2 = 2R; TP3 = 3R
-        ▼
-Open TradingView Chart ── Playwright: load saved layout, switch symbol
-        │                 and timeframe via URL, wait for render
-        ▼
-Capture Screenshot ── PNG saved to disk (path stored with the signal)
+Generate Screenshot from         Playwright: saved layout, symbol/timeframe
+TradingView                      via URL, wait for render, capture PNG
         │
         ▼
-Telegram Bot ──── alert with screenshot, validation checklist,
-        │         confidence score, and a TradingView chart link
+Overlay Entry / SL / TP /        Pillow, Python-drawn from the validated
+Highlights                       signal values (§7)
+        │
         ▼
-Signal snapshot persisted ── pair, TF, OHLC of all 3 candles, entry, SL,
-                             TP2, TP3, S/R details, screenshot path,
-                             timestamps → future backtesting/statistics
+Telegram Notification            alert + screenshot + validation checklist
+        │                        + confidence + TradingView link
+        ▼
+SQLite Logging                   full signal snapshot / near-miss rejections
 ```
 
-Every step after "Duplicate Check" is per-signal; everything before is the
-continuous 24/7 scan loop.
+Everything before "Duplicate Check" runs continuously 24/7; everything after
+runs per detected signal. A final strict validation gate re-runs the complete
+rule set on the exact setup object immediately before the duplicate check —
+if any rule fails, the setup is rejected and logged, never sent.
 
-## 4. Module map
-
-Kept modular; only the responsibilities move. New modules marked **NEW**,
-removed marked ~~struck~~.
+## 3. Module map
 
 ```
-├── mexc/                          NEW
-│   └── client.py                  Public futures market-data client:
-│                                  contract list + klines. Token-bucket rate
-│                                  limiter, retries with backoff + jitter.
-│                                  READ-ONLY — no auth, no trading endpoints.
-├── scanner/                       NEW
-│   ├── scheduler.py               Fires a sweep at each timeframe boundary
-│   │                              (+ small settle delay); tracks last
-│   │                              processed bar per (symbol, TF).
-│   └── engine.py                  Per-symbol scan: fetch candles → detect
-│                                  pattern → S/R filter → hand to pipeline.
+├── mexc/
+│   └── client.py              Public futures market-data client (contract
+│                              list + klines). Token-bucket rate limiter,
+│                              retries with backoff + jitter. READ-ONLY.
+├── scanner/
+│   ├── scheduler.py           Fires at each 15m/30m/1h close boundary
+│   │                          (+ settle delay); pure boundary math.
+│   └── engine.py              Sweep: fetch candles → drop forming candle →
+│                              skip processed bars → pre-filter → build
+│                              setup → hand to pipeline.
 ├── strategy/
-│   ├── models.py                  Candle / TamadSetup / ValidationReport
-│   ├── tamad_strategy.py          Pattern rules (kept — already pure Python)
-│   ├── sr_levels.py               NEW  S/R detection: swing high/low now;
-│   │                              fractals, daily/weekly H-L, pivots later
-│   │                              behind the same interface.
-│   ├── validation.py              Final pre-alert gate (kept, adapted)
-│   └── pipeline.py                dedup → screenshot → notify → persist
+│   ├── models.py              Candle / SRLevel / TamadSetup / ValidationReport
+│   ├── tamad_strategy.py      Pattern rules — the single source of truth
+│   ├── sr_levels.py           S/R detection behind a common interface;
+│   │                          swing_high_low now, fractals / daily / weekly /
+│   │                          pivots pluggable later
+│   ├── validation.py          Final strict pre-alert gate
+│   └── pipeline.py            validate → dedup → screenshot → annotate →
+│                              notify → persist
 ├── screenshots/
-│   └── capture.py                 Playwright: saved layout, symbol/TF via
-│                                  URL, render wait, capture. Annotation
-│                                  strategy per §7.
+│   ├── capture.py             Playwright capture of the saved layout +
+│   │                          best-effort pixel calibration (§7)
+│   └── annotate.py            Pillow overlay: highlights, level lines, legend
 ├── tradingview/
-│   ├── links.py                   NEW  chart-URL builder for alerts
-│   ├── pine_overlay.pine          NEW (optional) display-only companion
-│   │                              indicator — draws, never decides (§7)
-│   ├── ~~pine_script.pine~~       REMOVED (detection moves to Python)
-│   └── ~~webhook_handler.py~~     REMOVED (no inbound webhooks; a minimal
-│                                  /health endpoint moves to main.py)
-├── telegram/bot.py                Alert format per §8
-├── database/repository.py         Signals (full snapshots), rejections,
-│                                  duplicate guard, scan-progress state
-├── config/                        settings.py + config.yaml (§10)
+│   ├── links.py               Chart-URL builder for alerts
+│   └── pine_overlay.pine      Display-only fallback overlay (D1); OPTIONAL,
+│                              draws only, never detects
+├── telegram/bot.py            Alert formatting + Bot API delivery
+├── database/repository.py     Signal snapshots, near-miss rejections,
+│                              duplicate guard, per-bar scan state
+├── config/                    config.yaml + typed settings + logging
 ├── tests/
-└── main.py                        Wires scheduler + pipeline + health server
+└── main.py                    Wires everything; /health endpoint
 ```
 
-The strategy rules in `strategy/tamad_strategy.py` were already implemented
-as pure Python functions in v1 (they were the re-validation layer). In v2
-they are promoted from "verifier" to "detector" — same code, same tests, now
-the single source of truth.
+Deleted per D4: `tradingview/pine_script.pine`, `tradingview/webhook_handler.py`.
 
-## 5. Detection engine (100% Python)
+## 4. Data acquisition
 
-### 5.1 Data acquisition
+- **Symbol discovery:** `GET /api/v1/contract/detail` → all contracts;
+  keep USDT-quoted perpetuals in normal trading state. Refreshed hourly
+  (new listings picked up, delisted pairs dropped). Optional whitelist.
+- **Klines:** `GET /api/v1/contract/kline/{symbol}` (`Min15`/`Min30`/`Min60`),
+  fetching only `history_bars` (default 150) candles — enough for S/R
+  context plus the 3 pattern candles. No bulk historical downloads.
+- **Forming-candle handling:** any bar whose close time is after the sweep
+  boundary is discarded. Candle 3 must be exactly the bar that closed at the
+  boundary, verified by timestamp arithmetic; if the API hasn't published it
+  yet, one short retry, then skip and log.
+- **Evaluate once:** last processed bar per (symbol, timeframe) is persisted
+  in SQLite, so each bar is evaluated at most once, including across restarts.
+- **Rate limits:** token bucket (default 8 req/s, config) under MEXC's
+  ~20 req/2 s public limit. ~750 symbols ≈ 95 s per timeframe sweep; worst
+  case (hour boundary, all three TFs) ≈ 4–5 min, 15m sweep first. The
+  freshness rule (`max_signal_age_seconds`, default 600) guarantees a slow
+  sweep degrades to *no* alert rather than a stale one.
 
-- **Symbol discovery:** `GET /api/v1/contract/detail` on the MEXC futures
-  API → all contracts; keep those quoted/settled in USDT and in a tradable
-  state. Refreshed hourly (new listings picked up automatically; delisted
-  pairs dropped). Optional whitelist still supported.
-- **Klines:** `GET /api/v1/contract/kline/{symbol}` with `Min15` / `Min30` /
-  `Min60`. Per sweep, fetch only `history_bars` (default 150) candles — the
-  minimum needed for S/R context (left/right swing bars) plus the 3 pattern
-  candles. No bulk historical downloads.
-- **Forming candle handling:** the newest kline row is the live bar — always
-  discarded. Candle 3 is the newest *closed* bar, cross-checked by timestamp
-  arithmetic against the sweep boundary. If the API is lagging (candle-3
-  timestamp not yet present), the symbol is retried within the same sweep,
-  then skipped and logged.
-- **Newly-closed only:** last processed bar time per (symbol, timeframe) is
-  tracked in SQLite; a bar is evaluated at most once — also across restarts.
+## 5. Strategy rules (100% Python)
 
-### 5.2 Rate limits and sweep timing
-
-MEXC's public futures endpoints allow roughly 20 requests / 2 s per IP per
-endpoint. Design numbers:
-
-- ~750 active USDT perps × 1 kline request per sweep.
-- Token bucket at a conservative **8 req/s** (config) → ~95 s per timeframe
-  sweep.
-- Worst case at a full-hour boundary all three timeframes close at once:
-  ~2,250 requests ≈ **4–5 minutes** for the complete triple sweep,
-  interleaved so the 15m sweep (most time-sensitive) completes first.
-- Signal freshness is enforced: any setup whose Candle 3 closed more than
-  `max_signal_age_seconds` ago (default 600 s) is rejected as stale, so a
-  slow sweep can never produce misleadingly late alerts. This freshness
-  budget and the sweep time must be kept consistent in config.
-
-### 5.3 Strategy rules (unchanged semantics, Python only)
-
-- **Candle colors** — SHORT: green/red/green; LONG: red/green/red. Dojis
-  always fail.
-- **Equal close** — |close₁ − close₂| within `tolerance_percent` of close₁.
-- **Level derivation** (`comparison_mode`, see §5.4 open question):
-  the equal closes form the resistance (SHORT) / support (LONG).
-- **Third candle rule** — wick may pierce the level; close must not.
-- **Entry** — **Candle 3 close.** Never next-candle open, never market
-  price, never midpoint.
-- **Stop loss** — SHORT: highest high of candles 1–3; LONG: lowest low of
-  candles 1–3. No ATR, no indicators, no percentages, no volatility.
-- **Targets** — Risk = |Entry − SL|; TP2 = Entry ∓ 2 × Risk;
-  TP3 = Entry ∓ 3 × Risk. Both displayed.
-- **S/R filter** — the pattern level must sit within `proximity_percent` of
-  a *confirmed* structural level (§6). Middle-of-range patterns rejected.
-- **Final validation gate** — before any alert, the complete rule set is
-  re-run one last time on the exact setup object that will be sent
-  (identical to v1's `FinalValidator`, minus the now-obsolete
-  "does TradingView's payload match?" cross-checks).
-
-### 5.4 Equal-close configuration
-
-```yaml
-equal_close:
-  tolerance_percent: 0.05
-  comparison_mode: strict      # strict | midpoint | average
-```
-
-Proposed semantics (please confirm — see Open Decisions):
-
-- `strict` *(default)* — the level is the close Candle 3 is **least** allowed
-  to break (SHORT: the lower of the two closes; LONG: the higher). Strictest
-  possible reading; when in doubt, reject.
-- `midpoint` — the level is `(close₁ + close₂) / 2`.
-- `average` — with exactly two reference candles this is numerically the
-  same as `midpoint`; it is accepted as a config value (reserved for future
-  patterns that average more than two closes) and behaves like `midpoint`.
-  Flagged rather than silently invented — see Open Decision D2.
+- **Candle colors** — SHORT: green/red/green; LONG: red/green/red; dojis fail.
+- **Equal close** — |close₁ − close₂| ≤ close₁ × `tolerance_percent` / 100.
+- **Level** (`comparison_mode`):
+  - `strict` *(default)* — the close Candle 3 is least allowed to break
+    (SHORT: lower of the two closes; LONG: higher). When in doubt, reject.
+  - `midpoint` — `(close₁ + close₂) / 2`.
+  - *(`average` intentionally not offered — see D2.)*
+- **Third candle rule** — wick may pierce the level; the close must not.
+- **Entry** — Candle 3 close. Never next-candle open, market price, or midpoint.
+- **Stop loss** — SHORT: highest high of candles 1–3; LONG: lowest low.
+  No ATR, no indicators, no percentages, no volatility.
+- **Targets** — Risk = |Entry − SL|; TP2 = Entry ∓ 2·Risk; TP3 = Entry ∓ 3·Risk.
+- **Pre-filter vs full validation:** the sweep pre-filter is colors +
+  equal-close (defines a *candidate* and the near-miss logging boundary, D3);
+  every candidate then passes through the full validator.
 
 ## 6. Support / Resistance (configurable, never guessed)
 
 ```yaml
 support_resistance:
-  method: swing_high_low       # the only method implemented initially
+  method: swing_high_low
   left_bars: 20
   right_bars: 20
   proximity_percent: 0.25
 ```
 
-- `strategy/sr_levels.py` defines a small interface
-  (`SRDetector.find_levels(candles) -> list[SRLevel]`, where `SRLevel` has a
-  price, side, kind, and the bar it was confirmed at). `swing_high_low` is
-  the first implementation; **fractals, daily high/low, weekly high/low, and
-  pivot points** plug in behind the same interface later without touching
-  the scanner or pipeline.
-- A swing high is a bar whose high exceeds the `left_bars` highs before it
-  and the `right_bars` highs after it (mirror for swing lows). Only
-  **confirmed** swings are used.
-- **Inherent limitation (not a bug):** with `right_bars: 20`, a swing is
-  only confirmed 20 bars after it prints. The S/R level a pattern reacts to
-  is therefore always at least `right_bars` old. That is the correct,
-  non-repainting behavior — but it means very recent highs/lows are not yet
-  "levels". Lower `right_bars` for more responsive (and noisier) levels.
+`SRDetector.find_levels(candles) -> list[SRLevel]` is the interface;
+`swing_high_low` (a bar strictly exceeding `left_bars` highs before and
+`right_bars` highs after it, mirrored for lows) is the first implementation.
+Fractals, daily/weekly high-low, and pivot points plug in behind the same
+interface later. For a SHORT the pattern level must sit within
+`proximity_percent` of a confirmed *high*-side level; LONG mirrors with lows.
 
-## 7. TradingView screenshots — capabilities and limits (READ THIS)
+Inherent, non-repainting limitation: with `right_bars: 20` a swing confirms
+20 bars after it prints, so very recent extremes are not yet levels.
 
-Playwright drives a real browser against your saved TradingView layout:
+## 7. Screenshots & Python-drawn annotations (D1)
 
-1. Launch headless Chromium with a stored login session
-   (`storage_state.json`, exported once via a helper command).
-2. Open `https://www.tradingview.com/chart/<your-layout-id>/?symbol=MEXC:<SYM>&interval=<TF>`
-   — the symbol and timeframe switch via URL parameters; the layout's saved
-   appearance (colors, scales, your zoom level ≈ last 50–100 candles) is
-   preserved.
-3. Wait for the chart canvas to render plus a configurable settle delay.
-4. Screenshot the chart container; save PNG to `screenshots/out/` and record
-   the path in the signal snapshot.
+Capture flow: headless Chromium with a stored TradingView login session →
+open the saved layout with `?symbol=MEXC:<SYM>&interval=<TF>` → wait for the
+canvas plus a settle delay → screenshot the chart pane.
 
-### What is technically NOT reliable — and the honest alternatives
+**Annotation flow (Python-drawn, Pillow):** to place price-anchored lines on
+the captured image, the pixel↔price/time mapping is derived at capture time
+by *calibration*:
 
-**T1. Drawing annotations programmatically on tradingview.com is not
-dependable.** TradingView's chart is a closed canvas application with no
-public browser-side API. There is no supported way for Playwright to say
-"draw a line at price 118,730". Simulating mouse-drawn trendlines requires a
-price→pixel mapping that is not exposed (the price axis is also canvas), so
-coordinate-based drawing breaks on any zoom/scale difference and any UI
-update. **I will not build the alert path on top of that.** Three practical
-options instead, selectable in config:
+1. **Price axis:** hover the crosshair at two known y-pixels and read the
+   crosshair price from the page; two (pixel, price) points give the linear
+   y-mapping. (Requires a linear price scale on the layout — log scale
+   breaks the linear fit and is detected/refused.)
+2. **Time axis:** hover along the bar row and match the OHLC legend readout
+   against Candle 3's known values to find Candle 3's x-pixel and bar width.
+3. With the mapping, Pillow draws onto the PNG: translucent highlight box
+   over the three pattern candles, horizontal lines with price tags for S/R,
+   Entry, SL, TP2, TP3, and a legend panel with the full trade details.
 
-| Option | How the required annotations (3 candles, S/R, Entry, SL, TP2, TP3) get on the image | Trade-off |
-|---|---|---|
-| **A. `pine_overlay`** (default) | A *display-only* Pine indicator on your saved layout re-marks the pattern with the same deterministic rules and draws level lines. It makes **zero decisions** — Python remains the sole detector; Pine only paints. | Free, native TradingView look. Rare risk: TradingView's MEXC feed differing from the MEXC API on a boundary tick could make the overlay not paint a setup Python alerted (the alert itself is unaffected — the message always carries all prices). |
-| **B. `legend`** | Clean layout screenshot + a Python-rendered (Pillow) legend panel stamped onto the image: direction, entry, SL, TP2, TP3, S/R, the three candle timestamps. | 100% consistent with Python's numbers, zero TradingView coupling — but levels are text in a panel, **not horizontal lines positioned on the price scale** (impossible without the price→pixel mapping, see above). |
-| **C. `chart_img`** | chart-img.com's TradingView snapshot API accepts price-anchored drawing primitives — Python's exact entry/SL/TP/S-R values become real lines/zones on a TradingView-rendered chart. | The only option with *exact, Python-positioned* line annotations. Requires a paid API key; external dependency. |
+**Fallback chain (automatic, per capture):** TradingView's page internals are
+unversioned, so calibration is best-effort by design. If any step fails, the
+capture degrades gracefully and says so in logs:
 
-Recommendation: **A + B combined** as default (overlay for visuals, legend
-stamp for guaranteed numeric accuracy), with **C** available when exact
-drawn levels matter more than the free tier.
+1. `python_overlay` — full annotations (default).
+2. `legend_only` — clean chart + Pillow legend panel with all validated
+   numbers (always works; levels as text, not positioned lines).
+3. If field experience shows calibration chronically unreliable, the
+   display-only `tradingview/pine_overlay.pine` can be added to the saved
+   layout as a visual fallback (D1). It draws only — detection remains 100%
+   Python — and any drawing it makes is cosmetic, never authoritative.
 
-**T2. Automated login sessions are fragile.** TradingView sessions expire
-and occasionally trigger captchas; headless browsers can be flagged.
-Mitigations: persistent `storage_state`, session-health check at startup and
-before each capture, automatic re-try, and a Telegram *operational* warning
-("session expired — re-export storage state") so you learn about it
-immediately, not from silently image-less alerts. Also note plainly:
-automating the TradingView website sits in a gray zone of their ToS; option
-C (chart-img) is the fully sanctioned route if that concerns you.
+Known limitations, stated plainly: TradingView sessions expire and captchas
+can appear (mitigated by a session health check and a Telegram operational
+warning); automating tradingview.com is a ToS gray area; captures take
+~5–15 s per signal and are serialized; TradingView renders its own MEXC feed,
+which can differ from the MEXC API on rare boundary ticks — the authoritative
+numbers are always the Python-validated ones in the message and overlay.
+`on_failure` policy for a completely failed capture: `send_without_image`
+(default) or `skip_alert`.
 
-**T3. Screenshot latency.** A browser capture takes ~5–15 s per signal.
-Signals are queued, so a burst of simultaneous setups delays later
-screenshots; alerts still go out in order. `on_failure` policy stays:
-`send_without_image` (default) or `skip_alert`.
-
-**T4. Data-feed nuance.** Python detects on MEXC's official API data;
-TradingView renders its own MEXC feed. They agree in practice, but the
-authoritative numbers are always the ones in the Telegram text, which come
-from the API data Python validated.
-
-## 8. Telegram alert format
+## 8. Telegram alert
 
 ```
 🚨 TAMAD STRATEGY
 
-Pair:        BTCUSDT
-Direction:   SHORT
-Timeframe:   15m
+Pair:            BTCUSDT
+Direction:       SHORT
+Timeframe:       15m
 
-Entry:       118,250
-Stop Loss:   118,730
-TP2 (2R):    117,290
-TP3 (3R):    116,810
-Risk Reward: 1:2 / 1:3
+Entry:           118,250
+Stop Loss:       118,730
+Take Profit 2R:  117,290
+Take Profit 3R:  116,810
+Risk Reward:     1:2 / 1:3
 
-Detection Time: 2026-07-10 14:30:05 UTC
+Detection Time:  2026-07-10 14:30:05 UTC
 
 Validation
 ✅ Candle 1 Color
@@ -311,48 +229,39 @@ Validation
 Confidence
 7 / 7 Rules Passed
 
-📊 Open live chart:
-https://www.tradingview.com/chart/?symbol=MEXC:BTCUSDT.P&interval=15
+📊 https://www.tradingview.com/chart/?symbol=MEXC:BTCUSDT.P&interval=15
 ```
 
-- Screenshot attached as the photo, this text as the caption.
-- The checklist reflects the actual `ValidationReport` (it will always read
-  7/7 — anything less is rejected before reaching Telegram; the checklist
-  is confirmation of *what* was verified).
-- The TradingView link is always included, with symbol and interval
-  pre-selected.
+Screenshot attached as the photo, this text as the caption. The checklist is
+rendered from the actual validation report (an alert only exists at 7/7 —
+anything less was rejected upstream). The TradingView link always opens the
+live chart with symbol and interval pre-selected.
 
-## 9. Logging & persistence
+## 9. Persistence
 
-**Valid signals** — full snapshot stored on send (your requested feature,
-included from the start):
+**signals** — full snapshot per sent alert (backtesting-ready by design):
+identity (dedup key, exchange, pair, timeframe, direction), full OHLC + open
+time of Candles 1–3, equal-close level, S/R kind + price, entry, SL, risk,
+TP2, TP3, detection/sent timestamps, screenshot file path, and the serialized
+validation report.
 
-| field group | contents |
-|---|---|
-| identity | dedup key, exchange, pair, timeframe, direction |
-| pattern | full OHLC + open-time of Candles 1, 2, 3 |
-| levels | equal-close level, S/R type + level, entry, SL, risk, TP2, TP3 |
-| delivery | detection time, sent time, screenshot file path, screenshot attached y/n |
-| audit | serialized validation report (all 7 checks) |
+**rejections** (near-miss only, D3): pair, timeframe, direction, detection
+time, passed rules, failed rules, failure reason, OHLC of the three candles.
+Example: `BTCUSDT | 15m | REJECTED | third_candle_rule: candle 3 closed
+above resistance`.
 
-This table is the future backtesting/win-rate dataset; nothing in the core
-scanner needs to change to build analytics on top of it.
+**scan_state** — last processed bar per (symbol, timeframe): the
+evaluate-once guarantee across restarts.
 
-**Rejected signals** — every candidate that matched the color+equal-close
-pre-filter but failed any rule is stored with per-rule reasons, e.g.
-`BTCUSDT | REJECTED | third_candle_rule: candle 3 closed above resistance`.
-(Note: "rejected" rows are logged for *near-miss candidates*, not for every
-symbol scanned — logging all ~750 non-matches per sweep would be noise.)
+**Duplicate protection** (unchanged): dedup key
+`(exchange, symbol, timeframe, direction, candle3 open time)` claimed
+atomically *before* sending; survives restarts; a failed Telegram send
+releases the claim so the signal can be retried, a sent one can never repeat.
 
-**Operational logs** — structured, rotating: sweep timings, API failures,
-rate-limit backoffs, screenshot/session failures, Telegram delivery.
-
-## 10. Configuration sketch (v2 `config/config.yaml`)
+## 10. Configuration
 
 ```yaml
-exchange:
-  name: MEXC
-  tv_prefix: MEXC
+exchange: { name: MEXC, tv_prefix: MEXC }
 
 scanner:
   timeframes: ["15", "30", "60"]
@@ -360,6 +269,7 @@ scanner:
   history_bars: 150
   boundary_settle_seconds: 5
   max_signal_age_seconds: 600
+  clock_skew_seconds: 30
 
 mexc:
   base_url: https://contract.mexc.com
@@ -370,64 +280,44 @@ mexc:
 strategy:
   equal_close:
     tolerance_percent: 0.05
-    comparison_mode: strict          # strict | midpoint | average
+    comparison_mode: strict          # strict | midpoint
   support_resistance:
-    method: swing_high_low           # fractals / daily_hl / weekly_hl / pivots later
+    method: swing_high_low
     left_bars: 20
     right_bars: 20
     proximity_percent: 0.25
   risk_reward_targets: [2.0, 3.0]
 
 screenshots:
-  provider: playwright               # playwright | chart_img | disabled
-  annotations: pine_overlay_plus_legend   # pine_overlay | legend | chart_img
+  provider: playwright               # playwright | disabled
+  annotations: python_overlay        # python_overlay | legend_only | none
   on_failure: send_without_image     # send_without_image | skip_alert
   output_dir: screenshots/out
-  playwright: { chart_url: ..., storage_state_path: ..., render_wait_seconds: 6 }
+  playwright:
+    chart_url: https://www.tradingview.com/chart/     # your saved layout URL
+    storage_state_path: config/tv_storage_state.json
+    render_wait_seconds: 6
 
 telegram: { bot_token: ${TELEGRAM_BOT_TOKEN}, chat_id: ${TELEGRAM_CHAT_ID} }
 database: { path: database/tamad.sqlite3 }
 logging:  { level: INFO, file: logs/tamad.log }
 ```
 
-## 11. Reliability (24/7, self-recovering)
+## 11. Reliability
 
-- Scheduler, scanner sweeps, screenshot capture, and Telegram delivery are
-  isolated `asyncio` tasks; any per-symbol or per-signal exception is
-  caught, logged, and never stops the loop.
-- Network interruptions: exponential backoff with jitter on MEXC and
-  Telegram calls; a fully failed sweep is abandoned (freshness rule makes
-  late processing pointless) and the next boundary starts clean.
-- Duplicate protection unchanged from v1: dedup key
-  `(exchange, symbol, timeframe, direction, candle3 open time)` claimed
-  atomically in SQLite *before* sending; survives restarts; a failed
-  Telegram send releases the claim so the signal isn't lost.
-- Process supervision via Docker `restart: unless-stopped` (or systemd).
-- `/health` endpoint kept (uptime, last sweep per TF, queue depth, counters).
+- Scheduler, sweeps, capture, and delivery are isolated `asyncio` tasks; any
+  per-symbol or per-signal exception is logged and never stops the loop.
+- Exponential backoff + jitter on MEXC and Telegram; an unrecoverable sweep
+  is abandoned (freshness makes late processing pointless) and the next
+  boundary starts clean.
+- Process supervision via Docker `restart: unless-stopped` or systemd;
+  `/health` reports last sweep per timeframe, queue/counters, uptime.
 
-## 12. Testing plan
+## 12. Testing
 
-- Keep all passing v1 rule/validation/dedup/telegram tests (they test pure
-  Python logic that is unchanged).
-- New: S/R swing detection (synthetic series with known swings; confirmation
-  lag; proximity edge cases), sweep engine with a fake MEXC client (forming
-  candle dropped, bar processed exactly once, restart resume), rate limiter,
-  scheduler boundary math, alert formatting (checklist + link), snapshot
-  persistence round-trip.
-
-## 13. Open decisions — please confirm before implementation
-
-- **D1 — Annotation strategy default.** Proposed: Pine display-only overlay
-  **plus** stamped legend (option A+B, free), with chart-img (option C) as a
-  config switch for exact drawn levels. OK?
-- **D2 — `average` comparison mode.** With two candles, `average` ≡
-  `midpoint`. Implement it as an accepted alias with identical behavior
-  (documented), or drop it from the enum until a pattern exists where it
-  differs?
-- **D3 — Rejection logging scope.** Proposed: persist rejections only for
-  *near-miss candidates* (passed candle-colors + equal-close pre-filter,
-  failed a later rule). Logging every non-matching symbol/bar (~216k rows/day)
-  would drown the debugging signal. OK?
-- **D4 — v1 webhook removal.** The FastAPI webhook endpoint and the
-  detection Pine script are deleted outright (git history preserves them).
-  Any reason to keep a webhook fallback?
+Pure-logic modules (pattern rules, S/R detection, validation, boundary math,
+annotation rendering, message formatting, repository) are unit-tested
+directly; the sweep engine is tested against a fake MEXC client (forming
+candle dropped, evaluate-once, near-miss logging); the pipeline end-to-end
+with stubbed capture/Telegram. Live TradingView calibration is intentionally
+outside unit-test scope — it is guarded by the runtime fallback chain instead.
