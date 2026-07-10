@@ -1,0 +1,106 @@
+# Tamad Strategy scanner configuration.
+#
+# Any string may reference environment variables with ${VAR}. Keep secrets
+# (tokens, webhook secret) in the environment / .env — never in this file.
+
+app:
+  host: 0.0.0.0
+  port: 8080
+  # Shared secret that every TradingView alert must carry. Must match the
+  # "Webhook Secret" input of the Pine script. The scanner refuses to start
+  # when this is empty.
+  webhook_secret: ${WEBHOOK_SECRET}
+  # Reject signals whose third candle closed longer ago than this — a stale
+  # alert (e.g. delayed webhook delivery) is not tradeable.
+  max_alert_age_seconds: 600
+  # Allowance for clock drift between TradingView and this host when
+  # confirming that candle 3 has fully closed.
+  clock_skew_seconds: 30
+
+exchange:
+  name: MEXC
+  tv_prefix: MEXC          # TradingView exchange prefix (MEXC:BTCUSDT.P)
+  market: USDT Perpetual
+  symbol_suffix: USDT.P    # only USDT perpetual contracts are accepted
+
+scanner:
+  # TradingView interval strings, in minutes. Alerts on any other timeframe
+  # are rejected.
+  timeframes: ["15", "30", "60"]
+  symbols:
+    mode: all              # all | whitelist
+    whitelist: []          # e.g. ["BTCUSDT.P", "ETHUSDT.P"] when mode: whitelist
+
+strategy:
+  # Maximum difference between candle 1 and candle 2 closes, in percent.
+  equal_close_tolerance_pct: 0.05
+  # How the exact level is derived from the two near-equal closes:
+  #   strict — the close candle 3 is least allowed to break (default;
+  #            when in doubt, reject)
+  #   outer  — the more permissive of the two closes
+  #   avg    — midpoint of the two closes
+  # Must match the "Level Basis" input of the Pine script.
+  level_basis: strict
+  # Bars on each side required to confirm a swing/pivot in the Pine script.
+  swing_lookback: 10
+  # Maximum distance between the pattern level and the structural S/R level,
+  # in percent — patterns further from meaningful S/R are rejected.
+  sr_proximity_pct: 0.15
+  # S/R classifications accepted from TradingView.
+  allowed_sr_types:
+    - swing_high
+    - swing_low
+    - fractal_high
+    - fractal_low
+    - prev_day_high
+    - prev_day_low
+    - prev_week_high
+    - prev_week_low
+    - pivot
+  # R multiples for the displayed targets (TP2 = 2R, TP3 = 3R).
+  risk_reward_targets: [2.0, 3.0]
+
+telegram:
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  chat_id: ${TELEGRAM_CHAT_ID}
+  retries: 3
+  timeout_seconds: 30
+
+screenshots:
+  # playwright — headless Chromium screenshot of your TradingView layout
+  # chart_img  — chart-img.com snapshot API (api key required)
+  # disabled   — no screenshots (alerts flag the missing chart)
+  provider: playwright
+  # What to do when the screenshot cannot be captured:
+  #   send_without_image — deliver the alert with a warning line
+  #   skip_alert         — do not alert at all (strictest)
+  on_failure: send_without_image
+  playwright:
+    # Point this at YOUR saved TradingView chart layout that has the Tamad
+    # indicator applied, e.g. https://www.tradingview.com/chart/AbCdEfGh/
+    # The indicator draws the highlighted candles, S/R, entry, SL, TP2, TP3.
+    chart_url: https://www.tradingview.com/chart/
+    # Playwright storage state exported after logging in to TradingView
+    # (required for private layouts; see README).
+    storage_state_path: config/tv_storage_state.json
+    # Leave empty to use Playwright's own Chromium.
+    executable_path: ""
+    viewport: { width: 1600, height: 900 }
+    render_wait_seconds: 6
+    timeout_seconds: 45
+    retries: 2
+  chart_img:
+    api_key: ${CHART_IMG_API_KEY}
+    base_url: https://api.chart-img.com/v2/tradingview/advanced-chart
+    width: 1200
+    height: 675
+    timeout_seconds: 30
+
+database:
+  path: database/tamad.sqlite3
+
+logging:
+  level: INFO
+  file: logs/tamad.log
+  max_bytes: 10485760
+  backup_count: 5

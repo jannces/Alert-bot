@@ -1,0 +1,11 @@
+services:
+  tamad-scanner:
+    build: .
+    restart: unless-stopped        # automatic recovery after any failure
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./database:/app/database   # duplicate-alert guard survives restarts
+      - ./logs:/app/logs
+      - ./config:/app/config
