@@ -163,6 +163,23 @@ configured `on_failure` policy applies.
   *before* sending and survive restarts; a sent setup can never repeat.
 - **Operational logs:** rotating structured logs in `logs/tamad.log`.
 
+## Debugging: how close are near-misses getting?
+
+If alerts feel too rare, don't guess — check the data. While the scanner is
+running, in a **second** terminal:
+
+```bash
+python scripts/near_miss_report.py
+```
+
+This reads the `rejections` table and, for every candidate that failed the
+third-candle rule (the strategy's core "close must never pass the level"
+check), reports how far past the level it closed, closest-first. That tells
+you whether the remaining filter is actually close to firing (small
+overshoots — patience is the answer) or whether candidates are missing by a
+mile (a config knob is still too tight). It never changes the rule itself —
+it's read-only, for informed tuning decisions.
+
 ## Tests
 
 ```bash
