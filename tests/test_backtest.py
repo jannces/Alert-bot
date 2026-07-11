@@ -83,6 +83,13 @@ class TestSimulateExit:
         outcome, _ = simulate_exit(candles, len(candles) - 2, Direction.SHORT, 113.0, 102.5, 100)
         assert outcome is Outcome.LOSS
 
+    def test_same_bar_ambiguity_optimistic_is_a_win(self):
+        candles = self._series((114.0, 101.0))
+        outcome, _ = simulate_exit(
+            candles, len(candles) - 2, Direction.SHORT, 113.0, 102.5, 100, optimistic=True
+        )
+        assert outcome is Outcome.WIN
+
     def test_neither_level_within_horizon_is_a_timeout(self):
         candles = self._series((110.0, 106.0), (111.0, 105.0), (110.5, 106.5))
         outcome, _ = simulate_exit(candles, len(candles) - 4, Direction.SHORT, 113.0, 102.5, 100)

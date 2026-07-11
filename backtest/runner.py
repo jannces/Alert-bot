@@ -69,6 +69,7 @@ def run_variants(
     tolerance_pct: float,
     mode: ComparisonMode,
     horizon_bars: int,
+    optimistic: bool = False,
 ) -> list[VariantResult]:
     variants = build_variants()
     results = {name: VariantResult(name) for name in variants}
@@ -85,10 +86,12 @@ def run_variants(
             outcome_2r, _ = simulate_exit(
                 candles, signal.index, signal.direction,
                 signal.levels.stop_loss, signal.levels.tp2, horizon_bars,
+                optimistic=optimistic,
             )
             outcome_3r, _ = simulate_exit(
                 candles, signal.index, signal.direction,
                 signal.levels.stop_loss, signal.levels.tp3, horizon_bars,
+                optimistic=optimistic,
             )
             for name, confirmations in variants.items():
                 if not all(check(ctx) for check in confirmations):
@@ -146,6 +149,11 @@ async def main() -> None:
     )
     parser.add_argument("--horizon", type=int, default=400,
                         help="bars before an unresolved trade times out")
+    parser.add_argument(
+        "--ambiguity", default="conservative",
+        choices=["conservative", "optimistic"],
+        help="same-bar stop+target resolution; run both to bracket the truth",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -165,8 +173,10 @@ async def main() -> None:
         raise SystemExit("no data loaded — is contract.mexc.com reachable?")
 
     results = run_variants(
-        data, args.tolerance, ComparisonMode(args.mode), args.horizon
+        data, args.tolerance, ComparisonMode(args.mode), args.horizon,
+        optimistic=args.ambiguity == "optimistic",
     )
+    print(f"\n[mode={args.mode}, tolerance={args.tolerance}%, ambiguity={args.ambiguity}]")
     print_report(results, args.days, args.tf, len(data))
 
 

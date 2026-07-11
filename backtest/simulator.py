@@ -72,25 +72,30 @@ def simulate_exit(
     stop_loss: float,
     target: float,
     horizon_bars: int,
+    optimistic: bool = False,
 ) -> tuple[Outcome, int]:
     """Walk forward from the bar after entry until stop/target/horizon.
 
-    Returns the outcome and the number of bars held. Same-bar ambiguity is
-    resolved as a LOSS (stop assumed first).
+    Returns the outcome and the number of bars held. When one bar touches
+    both levels, the resolution order is ambiguous without lower-timeframe
+    data: the default (conservative) counts it as a LOSS, ``optimistic``
+    counts it as a WIN. Running both brackets the true win rate.
     """
     last = min(len(candles) - 1, entry_index + horizon_bars)
     for j in range(entry_index + 1, last + 1):
         bar = candles[j]
         if direction is Direction.SHORT:
-            if bar.high >= stop_loss:
-                return Outcome.LOSS, j - entry_index
-            if bar.low <= target:
-                return Outcome.WIN, j - entry_index
+            hit_stop = bar.high >= stop_loss
+            hit_target = bar.low <= target
         else:
-            if bar.low <= stop_loss:
-                return Outcome.LOSS, j - entry_index
-            if bar.high >= target:
-                return Outcome.WIN, j - entry_index
+            hit_stop = bar.low <= stop_loss
+            hit_target = bar.high >= target
+        if hit_stop and hit_target:
+            return (Outcome.WIN if optimistic else Outcome.LOSS), j - entry_index
+        if hit_stop:
+            return Outcome.LOSS, j - entry_index
+        if hit_target:
+            return Outcome.WIN, j - entry_index
     return Outcome.TIMEOUT, last - entry_index
 
 
