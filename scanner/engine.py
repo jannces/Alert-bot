@@ -51,6 +51,7 @@ class ScanEngine:
         self._pipeline = pipeline
         self._symbols: list[str] = []
         self._symbols_fetched_at = 0.0
+        self._active_timeframes: set[int] = set()
         self.last_sweep: dict[int, str] = {}  # tf minutes -> iso timestamp
 
     async def sweep(self, timeframes_minutes: list[int], boundary_ms: int) -> None:
@@ -61,8 +62,22 @@ class ScanEngine:
             return
         # Shortest timeframe first: its freshness budget is the tightest.
         for tf in sorted(timeframes_minutes):
+            if tf in self._active_timeframes:
+                # A previous sweep of this timeframe is still draining (rate
+                # limits); skipping keeps the backlog bounded. The missed bar
+                # stays unprocessed and is logged, never silently mis-scanned.
+                logger.warning(
+                    "sweep %dm at boundary %d skipped — previous sweep still running",
+                    tf,
+                    boundary_ms,
+                )
+                continue
+            self._active_timeframes.add(tf)
             started = time.monotonic()
-            await self._sweep_timeframe(tf, boundary_ms, symbols)
+            try:
+                await self._sweep_timeframe(tf, boundary_ms, symbols)
+            finally:
+                self._active_timeframes.discard(tf)
             self.last_sweep[tf] = datetime.now(timezone.utc).isoformat()
             logger.info(
                 "sweep %dm done: %d symbols in %.1fs",
@@ -129,9 +144,15 @@ class ScanEngine:
         c1, c2, c3 = closed[-3], closed[-2], closed[-1]
 
         strategy_cfg = self._settings.strategy
-        direction = rules.matches_prefilter(
-            c1, c2, c3, strategy_cfg.equal_close.tolerance_percent
+        equal_cfg = strategy_cfg.equal_close
+        near_cfg = strategy_cfg.near_miss
+        # Candidacy uses the widest configured bound so near-misses are seen.
+        prefilter_tolerance = (
+            max(equal_cfg.tolerance_percent, near_cfg.tolerance_percent)
+            if near_cfg.enabled
+            else equal_cfg.tolerance_percent
         )
+        direction = rules.matches_prefilter(c1, c2, c3, prefilter_tolerance)
         if direction is None:
             return  # no pattern — not persisted (near-miss logging boundary)
 
@@ -139,8 +160,22 @@ class ScanEngine:
             direction,
             c1.close,
             c2.close,
-            ComparisonMode(strategy_cfg.equal_close.comparison_mode),
+            ComparisonMode(equal_cfg.comparison_mode),
         )
+        graded = rules.grade_pattern(
+            direction,
+            c1,
+            c2,
+            c3,
+            level,
+            tolerance_pct=equal_cfg.tolerance_percent,
+            near_miss_enabled=near_cfg.enabled,
+            near_tolerance_pct=near_cfg.tolerance_percent,
+            near_overshoot_pct=near_cfg.overshoot_percent,
+        )
+        if graded is None:
+            return  # beyond even the near-miss allowances
+        grade, notes = graded
         sr = None
         if strategy_cfg.support_resistance.enabled:
             side = "high" if direction.value == "SHORT" else "low"
@@ -168,9 +203,12 @@ class ScanEngine:
             tp2=levels.tp2,
             tp3=levels.tp3,
             detected_at=datetime.now(timezone.utc),
+            grade=grade,
+            notes=notes,
         )
         logger.info(
-            "candidate: %s %s %dm (level=%s sr=%s)",
+            "candidate (%s): %s %s %dm (level=%s sr=%s)",
+            grade.value,
             direction.value,
             setup.symbol,
             tf_minutes,

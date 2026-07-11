@@ -96,6 +96,29 @@ class TestAlertMessage:
         assert "LONG" in text
         assert "6 / 6 Rules Passed" in text
 
+    def test_near_miss_message_is_clearly_labeled(self, validator):
+        from dataclasses import replace as dc_replace
+
+        from strategy.models import SignalGrade
+
+        base = make_short_setup()
+        setup = make_short_setup(
+            candle2=dc_replace(base.candle2, close=110.15),
+            level=110.15,
+            grade=SignalGrade.NEAR_MISS,
+            notes=(("equal_close", "closes differ by 0.136% (strict limit 0.1%)"),),
+        )
+        report = validator.validate(setup)
+        assert report.passed, report.summary()
+        text = build_alert_message(setup, report, CHART_URL, screenshot_ok=True)
+
+        assert "POTENTIAL SETUP" in text and "near miss" in text
+        assert "🚨" not in text  # never disguised as a full signal
+        assert "⚠️ Equal Close (relaxed)" in text
+        assert "5 / 6 strict rules — near miss" in text
+        assert "Deviations" in text
+        assert "closes differ by 0.136%" in text
+
     def test_missing_screenshot_adds_warning(self, validator):
         setup = make_short_setup()
         report = validator.validate(setup)

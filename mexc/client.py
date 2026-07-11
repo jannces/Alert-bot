@@ -30,6 +30,51 @@ logger = logging.getLogger(__name__)
 _INTERVAL_BY_MINUTES = {1: "Min1", 5: "Min5", 15: "Min15", 30: "Min30", 60: "Min60"}
 
 
+def resample_candles(
+    candles: list[Candle], base_minutes: int, target_minutes: int
+) -> list[Candle]:
+    """Aggregate native candles into a larger timeframe (e.g. 2×5m → 10m).
+
+    Only complete, gap-free buckets aligned to the target grid are emitted —
+    a partial bucket would carry a wrong close, so it is dropped instead.
+    """
+    if target_minutes % base_minutes != 0:
+        raise ValueError(f"{target_minutes}m is not a multiple of {base_minutes}m")
+    ratio = target_minutes // base_minutes
+    step_ms = target_minutes * 60_000
+    base_ms = base_minutes * 60_000
+
+    buckets: dict[int, list[Candle]] = {}
+    for candle in candles:
+        buckets.setdefault(candle.open_time_ms - candle.open_time_ms % step_ms, []).append(candle)
+
+    result: list[Candle] = []
+    for start in sorted(buckets):
+        group = sorted(buckets[start], key=lambda c: c.open_time_ms)
+        expected = [start + i * base_ms for i in range(ratio)]
+        if [c.open_time_ms for c in group] != expected:
+            continue  # incomplete or gappy bucket
+        result.append(
+            Candle(
+                open_time_ms=start,
+                open=group[0].open,
+                high=max(c.high for c in group),
+                low=min(c.low for c in group),
+                close=group[-1].close,
+                volume=sum(c.volume for c in group),
+            )
+        )
+    return result
+
+
+def _native_base(timeframe_minutes: int) -> int | None:
+    """Largest native interval that divides the requested timeframe."""
+    for native in sorted(_INTERVAL_BY_MINUTES, reverse=True):
+        if timeframe_minutes % native == 0:
+            return native
+    return None
+
+
 def api_symbol_to_tv(api_symbol: str) -> str:
     """``BTC_USDT`` (MEXC API) → ``BTCUSDT.P`` (TradingView ticker)."""
     return api_symbol.replace("_", "") + ".P"
@@ -101,12 +146,24 @@ class MexcClient:
     ) -> list[Candle]:
         """The most recent ``bars`` candles, oldest first.
 
-        The newest returned candle is usually the live (forming) bar — the
-        caller is responsible for discarding unfinished candles by timestamp.
+        Timeframes MEXC does not serve natively (e.g. 10m) are built by
+        aggregating the largest native interval that divides them (2×5m),
+        still costing a single API request. The newest returned candle is
+        usually the live (forming) bar — the caller is responsible for
+        discarding unfinished candles by timestamp.
         """
         end_s = int(time.time())
+        if timeframe_minutes in _INTERVAL_BY_MINUTES:
+            start_s = end_s - bars * timeframe_minutes * 60
+            return await self.fetch_klines_range(
+                api_symbol, timeframe_minutes, start_s, end_s
+            )
+        base = _native_base(timeframe_minutes)
+        if base is None:
+            raise ValueError(f"unsupported timeframe: {timeframe_minutes} minutes")
         start_s = end_s - bars * timeframe_minutes * 60
-        return await self.fetch_klines_range(api_symbol, timeframe_minutes, start_s, end_s)
+        native = await self.fetch_klines_range(api_symbol, base, start_s, end_s)
+        return resample_candles(native, base, timeframe_minutes)
 
     async def fetch_klines_range(
         self, api_symbol: str, timeframe_minutes: int, start_s: int, end_s: int

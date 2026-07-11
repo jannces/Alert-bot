@@ -18,6 +18,20 @@ class Direction(str, enum.Enum):
     SHORT = "SHORT"
 
 
+class SignalGrade(str, enum.Enum):
+    """How completely a setup satisfies the strict Tamad rules.
+
+    FULL — every strict rule satisfied exactly.
+    NEAR_MISS — the pattern is present but one or two quantitative bounds
+    were stretched within the configured near-miss allowances (e.g. the
+    equal-close difference or a small close beyond the level). Near-miss
+    alerts are clearly labeled and list their deviations.
+    """
+
+    FULL = "full"
+    NEAR_MISS = "near_miss"
+
+
 class SRKind(str, enum.Enum):
     """Kind of support/resistance level the pattern formed at.
 
@@ -133,6 +147,10 @@ class TamadSetup:
     tp2: float
     tp3: float
     detected_at: datetime
+    grade: SignalGrade = SignalGrade.FULL
+    # (code, human text) pairs describing near-miss deviations; codes are
+    # "equal_close" / "third_candle". Empty for FULL signals.
+    notes: tuple[tuple[str, str], ...] = ()
 
     @property
     def candles(self) -> tuple[Candle, Candle, Candle]:

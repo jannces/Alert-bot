@@ -99,8 +99,23 @@ class SupportResistanceSettings(BaseModel):
     proximity_percent: float = Field(default=0.25, gt=0)
 
 
+class NearMissSettings(BaseModel):
+    """Bounds for 'potential setup' alerts (most of the strategy present).
+
+    A near-miss must still show the exact candle color sequence on fully
+    closed candles; only these two quantitative bounds may stretch.
+    """
+
+    enabled: bool = True
+    # Relaxed equal-close bound (the strict bound is equal_close.tolerance_percent).
+    tolerance_percent: float = Field(default=0.25, ge=0)
+    # Candle 3's close may break the level by at most this much, in percent.
+    overshoot_percent: float = Field(default=0.1, ge=0)
+
+
 class StrategySettings(BaseModel):
     equal_close: EqualCloseSettings = Field(default_factory=EqualCloseSettings)
+    near_miss: NearMissSettings = Field(default_factory=NearMissSettings)
     support_resistance: SupportResistanceSettings = Field(
         default_factory=SupportResistanceSettings
     )

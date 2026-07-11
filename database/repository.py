@@ -116,8 +116,18 @@ class SignalRepository:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+        # Lightweight migrations for databases created by earlier versions.
+        for table in ("signals", "rejections"):
+            self._ensure_column(table, "grade", "TEXT NOT NULL DEFAULT 'full'")
         self._conn.commit()
         self._lock = threading.Lock()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        existing = {
+            row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")
+        }
+        if column not in existing:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def close(self) -> None:
         with self._lock:
@@ -144,9 +154,9 @@ class SignalRepository:
                         c3_open_time_ms, c3_open, c3_high, c3_low, c3_close,
                         level, sr_kind, sr_price,
                         entry, stop_loss, risk, tp2, tp3,
-                        detected_at, validation_json, created_at
+                        detected_at, validation_json, created_at, grade
                     ) VALUES (?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,
-                              ?,?,?, ?,?,?,?,?, ?,?,?)
+                              ?,?,?, ?,?,?,?,?, ?,?,?,?)
                     """,
                     (
                         setup.dedup_key,
@@ -169,6 +179,7 @@ class SignalRepository:
                         setup.detected_at.isoformat(),
                         _report_json(report),
                         _utcnow(),
+                        setup.grade.value,
                     ),
                 )
                 self._conn.commit()
@@ -210,8 +221,8 @@ class SignalRepository:
                 INSERT INTO rejections (
                     exchange, symbol, pair, timeframe_minutes, direction,
                     detected_at, passed_rules, failed_rules, failure_reason,
-                    candles_json, created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    candles_json, created_at, grade
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     setup.exchange,
@@ -225,6 +236,7 @@ class SignalRepository:
                     report.summary(),
                     _candles_json(setup),
                     _utcnow(),
+                    setup.grade.value,
                 ),
             )
             self._conn.commit()

@@ -47,6 +47,7 @@ class SweepScheduler:
         self._timeframes = sorted(timeframes_minutes)
         self._settle = settle_seconds
         self._on_sweep = on_sweep
+        self._sweep_tasks: set[asyncio.Task] = set()
         self.last_boundary_ms: int | None = None
 
     async def run(self) -> None:
@@ -55,18 +56,33 @@ class SweepScheduler:
             self._timeframes,
             self._settle,
         )
-        while True:
-            now_ms = int(time.time() * 1000)
-            boundary = min(next_boundary_ms(now_ms, tf) for tf in self._timeframes)
-            sleep_s = (boundary - now_ms) / 1000 + self._settle
-            logger.debug("sleeping %.1fs until boundary %d", sleep_s, boundary)
-            await asyncio.sleep(sleep_s)
+        try:
+            while True:
+                now_ms = int(time.time() * 1000)
+                boundary = min(next_boundary_ms(now_ms, tf) for tf in self._timeframes)
+                sleep_s = (boundary - now_ms) / 1000 + self._settle
+                logger.debug("sleeping %.1fs until boundary %d", sleep_s, boundary)
+                await asyncio.sleep(sleep_s)
 
-            closing = timeframes_closing_at(boundary, self._timeframes)
-            self.last_boundary_ms = boundary
-            try:
-                await self._on_sweep(closing, boundary)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - the scheduler must survive anything
-                logger.exception("sweep for boundary %d failed", boundary)
+                closing = timeframes_closing_at(boundary, self._timeframes)
+                self.last_boundary_ms = boundary
+                # Fire-and-track: a slow multi-timeframe sweep (rate limits)
+                # must never make the scheduler miss the next 5m boundary.
+                # The engine's per-timeframe guard keeps overlap bounded.
+                task = asyncio.create_task(
+                    self._run_sweep(closing, boundary),
+                    name=f"sweep-{boundary}",
+                )
+                self._sweep_tasks.add(task)
+                task.add_done_callback(self._sweep_tasks.discard)
+        finally:
+            for task in self._sweep_tasks:
+                task.cancel()
+
+    async def _run_sweep(self, closing: list[int], boundary: int) -> None:
+        try:
+            await self._on_sweep(closing, boundary)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the scheduler must survive anything
+            logger.exception("sweep for boundary %d failed", boundary)

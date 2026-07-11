@@ -143,8 +143,59 @@ async def test_retry_succeeds_after_transient_failure():
 
 
 @pytest.mark.asyncio
-async def test_unsupported_timeframe_rejected():
+async def test_range_fetch_requires_native_timeframe():
+    # fetch_klines resamples non-native timeframes (e.g. 10m from 5m), but
+    # the raw range endpoint only speaks MEXC's native intervals.
     client = make_client(lambda request: httpx.Response(200, json={}))
     with pytest.raises(ValueError):
-        await client.fetch_klines("BTC_USDT", 7, 10)
+        await client.fetch_klines_range("BTC_USDT", 10, 0, 1000)
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_10m_timeframe_is_resampled_from_5m():
+    t0 = 1_700_000_400  # aligned to a 10m boundary (seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["interval"] == "Min5"  # native base
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "time": [t0, t0 + 300, t0 + 600, t0 + 900, t0 + 1200],
+                    "open": [100.0, 102.0, 104.0, 103.0, 105.0],
+                    "high": [103.0, 105.0, 106.0, 104.5, 107.0],
+                    "low": [99.0, 101.0, 102.0, 101.5, 104.0],
+                    "close": [102.0, 104.0, 103.0, 104.2, 106.0],
+                    "vol": [10.0, 20.0, 5.0, 7.0, 3.0],
+                },
+            },
+        )
+
+    client = make_client(handler)
+    candles = await client.fetch_klines("BTC_USDT", 10, 5)
+    # 5 five-minute bars → 2 complete 10m buckets; the trailing bar is dropped.
+    assert len(candles) == 2
+    first, second = candles
+    assert first.open_time_ms == t0 * 1000
+    assert (first.open, first.high, first.low, first.close) == (100.0, 105.0, 99.0, 104.0)
+    assert first.volume == 30.0
+    assert second.open_time_ms == (t0 + 600) * 1000
+    assert (second.open, second.high, second.low, second.close) == (104.0, 106.0, 101.5, 104.2)
+    await client.aclose()
+
+
+def test_resample_drops_gappy_buckets():
+    from mexc.client import resample_candles
+    from strategy.models import Candle
+
+    step = 300_000  # 5m in ms
+    candles = [
+        Candle(0, 1, 2, 0.5, 1.5),
+        Candle(step, 1.5, 2.5, 1.0, 2.0),
+        # 10m bucket at 600_000 is missing its first 5m bar:
+        Candle(600_000 + step, 2.0, 3.0, 1.5, 2.5),
+    ]
+    result = resample_candles(candles, 5, 10)
+    assert len(result) == 1 and result[0].open_time_ms == 0

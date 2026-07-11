@@ -18,7 +18,7 @@ from datetime import timezone
 import httpx
 
 from config.settings import TelegramSettings
-from strategy.models import TamadSetup, ValidationReport
+from strategy.models import SignalGrade, TamadSetup, ValidationReport
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +62,19 @@ def build_alert_message(
     detected = setup.detected_at.astimezone(timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S UTC"
     )
+    near_miss = setup.grade is SignalGrade.NEAR_MISS
+    relaxed_codes = {code for code, _ in setup.notes}
+    # Which checklist rows were satisfied via a relaxed near-miss bound.
+    relaxed_rows = {
+        "Equal Close": "equal_close" in relaxed_codes,
+        "Candle 3 Rule": "third_candle" in relaxed_codes,
+    }
+
     passed = set(report.passed_names)
     all_names = {check.name for check in report.checks}
     checklist = []
     total = 0
-    ok_count = 0
+    strict_count = 0
     for label, check_names in _CHECKLIST:
         # Rows whose rules were not evaluated at all (e.g. the S/R filter is
         # disabled in config) are omitted rather than shown as failures.
@@ -75,11 +83,19 @@ def build_alert_message(
             continue
         ok = all(name in passed for name in relevant)
         total += 1
-        ok_count += ok
-        checklist.append(f"{'✅' if ok else '❌'} {label}")
+        if ok and relaxed_rows.get(label):
+            checklist.append(f"⚠️ {label} (relaxed)")
+        else:
+            strict_count += ok
+            checklist.append(f"{'✅' if ok else '❌'} {label}")
 
+    header = (
+        "🟡 <b>TAMAD — POTENTIAL SETUP</b> (near miss)"
+        if near_miss
+        else "🚨 <b>TAMAD STRATEGY</b>"
+    )
     lines = [
-        "🚨 <b>TAMAD STRATEGY</b>",
+        header,
         "",
         f"<b>Pair:</b> {html.escape(setup.pair)}",
         f"<b>Direction:</b> {setup.direction.value}",
@@ -97,7 +113,16 @@ def build_alert_message(
         *checklist,
         "",
         "<b>Confidence</b>",
-        f"{ok_count} / {total} Rules Passed",
+        (
+            f"{strict_count} / {total} strict rules — near miss"
+            if near_miss
+            else f"{strict_count} / {total} Rules Passed"
+        ),
+    ]
+    if setup.notes:
+        lines += ["", "<b>Deviations</b>"]
+        lines += [f"• {html.escape(text)}" for _, text in setup.notes]
+    lines += [
         "",
         f"📊 <a href=\"{html.escape(chart_url, quote=True)}\">Open live chart on TradingView</a>",
         html.escape(chart_url),

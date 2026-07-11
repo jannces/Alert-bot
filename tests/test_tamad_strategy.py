@@ -4,15 +4,19 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from strategy.models import Candle, Direction
+import pytest
+
+from strategy.models import Candle, Direction, SignalGrade
 from strategy.tamad_strategy import (
     ComparisonMode,
     candle_colors_valid,
     compute_trade_levels,
     equal_close,
+    grade_pattern,
     matches_prefilter,
     pattern_level,
     sr_level_is_meaningful,
+    third_candle_overshoot_pct,
     third_candle_respects_level,
 )
 from tests.fixtures import long_candles, short_candles
@@ -152,6 +156,68 @@ class TestPrefilter:
         c1, c2, c3 = short_candles()
         c3 = replace(c3, close=110.5, high=112.0)
         assert matches_prefilter(c1, c2, c3, TOL) is Direction.SHORT
+
+
+class TestGradePattern:
+    """Grading: FULL vs NEAR_MISS vs no signal (single source of truth)."""
+
+    BOUNDS = dict(
+        tolerance_pct=0.1,
+        near_miss_enabled=True,
+        near_tolerance_pct=0.25,
+        near_overshoot_pct=0.1,
+    )
+
+    def _grade(self, c1, c2, c3, **overrides):
+        level = pattern_level(Direction.SHORT, c1.close, c2.close, ComparisonMode.OUTER)
+        return grade_pattern(
+            Direction.SHORT, c1, c2, c3, level, **{**self.BOUNDS, **overrides}
+        )
+
+    def test_perfect_pattern_grades_full(self):
+        c1, c2, c3 = short_candles()
+        grade, notes = self._grade(c1, c2, c3)
+        assert grade is SignalGrade.FULL and notes == ()
+
+    def test_stretched_equal_close_grades_near_miss(self):
+        c1, c2, c3 = short_candles()
+        c2 = replace(c2, close=110.15)  # 0.136%: beyond 0.1, within 0.25
+        grade, notes = self._grade(c1, c2, c3)
+        assert grade is SignalGrade.NEAR_MISS
+        assert [code for code, _ in notes] == ["equal_close"]
+
+    def test_small_overshoot_grades_near_miss(self):
+        c1, c2, c3 = short_candles()
+        c3 = replace(c3, close=110.12)  # 0.09% beyond the 110.02 outer level
+        grade, notes = self._grade(c1, c2, c3)
+        assert grade is SignalGrade.NEAR_MISS
+        assert [code for code, _ in notes] == ["third_candle"]
+
+    def test_both_deviations_together_are_still_near_miss(self):
+        c1, c2, c3 = short_candles()
+        c2 = replace(c2, close=110.15)  # level (outer) becomes 110.15
+        c3 = replace(c3, close=110.2)  # 0.045% beyond 110.15
+        grade, notes = self._grade(c1, c2, c3)
+        assert grade is SignalGrade.NEAR_MISS
+        assert {code for code, _ in notes} == {"equal_close", "third_candle"}
+
+    def test_beyond_near_bounds_is_no_signal(self):
+        c1, c2, c3 = short_candles()
+        assert self._grade(c1, replace(c2, close=110.5), c3) is None  # 0.45% apart
+        assert self._grade(c1, c2, replace(c3, close=110.5)) is None  # 0.43% over
+
+    def test_disabled_near_miss_only_grades_full(self):
+        c1, c2, c3 = short_candles()
+        stretched = replace(c2, close=110.15)
+        assert self._grade(c1, stretched, c3, near_miss_enabled=False) is None
+        grade, _ = self._grade(c1, c2, c3, near_miss_enabled=False)
+        assert grade is SignalGrade.FULL
+
+    def test_overshoot_math(self):
+        _, _, c3 = short_candles()
+        assert third_candle_overshoot_pct(Direction.SHORT, c3, 110.02) == 0.0
+        over = third_candle_overshoot_pct(Direction.SHORT, replace(c3, close=110.13), 110.02)
+        assert over == pytest.approx(0.1, abs=0.001)
 
 
 class TestSRProximity:

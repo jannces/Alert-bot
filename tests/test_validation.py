@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 
 from config.settings import Settings
-from strategy.models import SRKind, SRLevel
+from strategy.models import SignalGrade, SRKind, SRLevel
 from strategy.validation import FinalValidator
 from tests.fixtures import NOW_MS, TF_MS, make_long_setup, make_short_setup
 
@@ -171,6 +171,57 @@ class TestRejections:
         strict_settings.strategy.equal_close.comparison_mode = "strict"
         strict = FinalValidator(strict_settings, now_ms=lambda: NOW_MS)
         report = strict.validate(make_short_setup(candle3=in_zone_c3, level=110.0))
+        assert "third_candle_rule" in failed_names(report)
+
+
+def make_near_miss_setup():
+    """Fixture SHORT with c2 close stretched to 110.15 (0.136% from c1)."""
+    base = make_short_setup()
+    c2 = replace(base.candle2, close=110.15)
+    return make_short_setup(
+        candle2=c2,
+        level=110.15,  # outer level moves to the stretched close
+        grade=SignalGrade.NEAR_MISS,
+        notes=(("equal_close", "closes differ by 0.136% (strict limit 0.1%)"),),
+    )
+
+
+class TestNearMissGrading:
+    def test_near_miss_setup_passes_validation(self, validator):
+        report = validator.validate(make_near_miss_setup())
+        assert report.passed, report.summary()
+
+    def test_near_miss_mislabeled_as_full_is_rejected(self, validator):
+        mislabeled = replace(make_near_miss_setup(), grade=SignalGrade.FULL, notes=())
+        report = validator.validate(mislabeled)
+        assert {"equal_close", "grade_consistency"} & set(failed_names(report))
+
+    def test_full_setup_mislabeled_as_near_miss_is_rejected(self, validator):
+        # A perfect pattern claiming to be a near miss is inconsistent data.
+        mislabeled = replace(make_short_setup(), grade=SignalGrade.NEAR_MISS)
+        report = validator.validate(mislabeled)
+        assert "grade_consistency" in failed_names(report)
+
+    def test_near_miss_rejected_when_feature_disabled(self):
+        settings = Settings()
+        settings.strategy.near_miss.enabled = False
+        validator = FinalValidator(settings, now_ms=lambda: NOW_MS)
+        report = validator.validate(make_near_miss_setup())
+        assert "grade_consistency" in failed_names(report)
+
+    def test_overshoot_beyond_allowance_rejected_even_as_near_miss(self, validator):
+        base = make_short_setup()
+        c3 = replace(base.candle3, close=110.2)  # 0.16% beyond 110.02 > 0.1%
+        setup = make_short_setup(
+            candle3=c3,
+            entry=110.2,
+            risk=2.8,
+            tp2=110.2 - 5.6,
+            tp3=110.2 - 8.4,
+            grade=SignalGrade.NEAR_MISS,
+            notes=(("third_candle", "x"),),
+        )
+        report = validator.validate(setup)
         assert "third_candle_rule" in failed_names(report)
 
 

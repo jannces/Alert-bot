@@ -14,8 +14,8 @@ exchange:
 
 scanner:
   # Timeframes in minutes. A sweep runs whenever a candle of any of these
-  # timeframes closes.
-  timeframes: ["15", "30", "60"]
+  # timeframes closes. 10m is built by aggregating 2x5m MEXC candles.
+  timeframes: ["5", "10", "15", "30", "60"]
   symbols:
     mode: all           # all | whitelist
     whitelist: []       # e.g. ["BTCUSDT.P", "ETHUSDT.P"] when mode: whitelist
@@ -57,6 +57,15 @@ strategy:
     # ("average" is intentionally not offered: with two candles it equals
     #  the midpoint — see ARCHITECTURE.md, decision D2.)
     comparison_mode: outer
+  # "Potential setup" alerts: the exact candle color sequence on fully
+  # closed candles is still mandatory, but these two bounds may stretch.
+  # Such alerts are clearly labeled 🟡 near-miss and list their deviations.
+  near_miss:
+    enabled: true
+    # Relaxed equal-close bound (strict bound is tolerance_percent above).
+    tolerance_percent: 0.25
+    # Candle 3 may close beyond the level by at most this much, in percent.
+    overshoot_percent: 0.1
   support_resistance:
     # Optional confirmation that the pattern formed at a meaningful S/R
     # level. DISABLED: patterns anywhere on the chart qualify, and the

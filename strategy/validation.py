@@ -22,6 +22,7 @@ from strategy import tamad_strategy as rules
 from strategy.models import (
     CheckResult,
     Direction,
+    SignalGrade,
     TamadSetup,
     ValidationReport,
 )
@@ -90,24 +91,56 @@ class FinalValidator:
                 )
             )
 
-        # --- rule 2: equal closing price ---------------------------------------
-        tolerance = cfg.strategy.equal_close.tolerance_percent
+        # --- rules 2+3: equal close + third-candle rule, grade-aware ------------
+        # FULL signals must satisfy the strict bounds exactly; NEAR_MISS
+        # signals must fit the configured near-miss allowances. The grade
+        # itself is recomputed from raw data and must match what the engine
+        # claimed — a mislabeled setup is rejected.
+        equal_cfg = cfg.strategy.equal_close
+        near_cfg = cfg.strategy.near_miss
+        mode = ComparisonMode(equal_cfg.comparison_mode)
+        level = rules.pattern_level(direction, c1.close, c2.close, mode)
+        graded = rules.grade_pattern(
+            direction,
+            c1,
+            c2,
+            c3,
+            level,
+            tolerance_pct=equal_cfg.tolerance_percent,
+            near_miss_enabled=near_cfg.enabled,
+            near_tolerance_pct=near_cfg.tolerance_percent,
+            near_overshoot_pct=near_cfg.overshoot_percent,
+        )
+        equal_bound = (
+            near_cfg.tolerance_percent
+            if setup.grade is SignalGrade.NEAR_MISS
+            else equal_cfg.tolerance_percent
+        )
         add(
             CheckResult(
                 "equal_close",
-                rules.equal_close(c1.close, c2.close, tolerance),
-                f"candle 1/2 closes differ by more than {tolerance}%",
+                rules.equal_close(c1.close, c2.close, equal_bound),
+                f"candle 1/2 closes differ by more than {equal_bound}%",
             )
         )
-
-        # --- rule 3: third candle must respect the level -------------------------
-        mode = ComparisonMode(cfg.strategy.equal_close.comparison_mode)
-        level = rules.pattern_level(direction, c1.close, c2.close, mode)
+        overshoot = rules.third_candle_overshoot_pct(direction, c3, level)
+        overshoot_bound = (
+            near_cfg.overshoot_percent if setup.grade is SignalGrade.NEAR_MISS else 0.0
+        )
         add(
             CheckResult(
                 "third_candle_rule",
-                rules.third_candle_respects_level(direction, c3, level),
-                "candle 3 closed through the level formed by the equal closes",
+                overshoot <= overshoot_bound,
+                "candle 3 closed through the level formed by the equal closes "
+                f"(overshoot {overshoot:.4f}% > allowed {overshoot_bound}%)",
+            )
+        )
+        add(
+            CheckResult(
+                "grade_consistency",
+                graded is not None and graded[0] is setup.grade,
+                f"setup labeled {setup.grade.value} but raw data grades as "
+                f"{graded[0].value if graded else 'no signal'}",
             )
         )
         add(

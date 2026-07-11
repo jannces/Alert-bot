@@ -7,7 +7,7 @@ import pytest
 from config.settings import Settings
 from database.repository import SignalRepository
 from scanner.engine import ScanEngine
-from strategy.models import Candle, Direction, SRKind, TamadSetup
+from strategy.models import Candle, Direction, SignalGrade, SRKind, TamadSetup
 from strategy.sr_levels import SwingHighLowDetector
 
 TF = 15
@@ -102,6 +102,52 @@ async def test_pattern_becomes_a_fully_built_candidate(tmp_path):
     assert setup.sr is not None
     assert setup.sr.kind is SRKind.SWING_HIGH and setup.sr.price == 110.1
     assert setup.candle3.open_time_ms == t(19)  # the just-closed bar
+
+
+@pytest.mark.asyncio
+async def test_perfect_pattern_is_graded_full(tmp_path):
+    engine, pipeline, _ = make_engine(tmp_path, FakeMexcClient(pattern_series()))
+    await engine.sweep([TF], BOUNDARY_MS)
+    assert pipeline.setups[0].grade is SignalGrade.FULL
+    assert pipeline.setups[0].notes == ()
+
+
+@pytest.mark.asyncio
+async def test_stretched_pattern_is_delivered_as_near_miss(tmp_path):
+    series = pattern_series()
+    # Stretch candle 2's close to 110.15: 0.136% from candle 1 — beyond the
+    # strict 0.1% bound, inside the 0.25% near-miss bound.
+    c2 = series[-3]
+    series[-3] = Candle(c2.open_time_ms, c2.open, c2.high, c2.low, 110.15)
+    engine, pipeline, _ = make_engine(tmp_path, FakeMexcClient(series))
+    await engine.sweep([TF], BOUNDARY_MS)
+
+    assert len(pipeline.setups) == 1
+    setup = pipeline.setups[0]
+    assert setup.grade is SignalGrade.NEAR_MISS
+    assert [code for code, _ in setup.notes] == ["equal_close"]
+    assert setup.level == 110.15  # outer level follows the stretched close
+
+
+@pytest.mark.asyncio
+async def test_pattern_beyond_near_bounds_is_not_a_candidate(tmp_path):
+    series = pattern_series()
+    c2 = series[-3]
+    series[-3] = Candle(c2.open_time_ms, c2.open, c2.high, c2.low, 110.5)  # 0.45%
+    engine, pipeline, _ = make_engine(tmp_path, FakeMexcClient(series))
+    await engine.sweep([TF], BOUNDARY_MS)
+    assert not pipeline.setups
+
+
+@pytest.mark.asyncio
+async def test_near_miss_disabled_reverts_to_strict_only(tmp_path):
+    series = pattern_series()
+    c2 = series[-3]
+    series[-3] = Candle(c2.open_time_ms, c2.open, c2.high, c2.low, 110.15)
+    engine, pipeline, _ = make_engine(tmp_path, FakeMexcClient(series))
+    engine._settings.strategy.near_miss.enabled = False
+    await engine.sweep([TF], BOUNDARY_MS)
+    assert not pipeline.setups
 
 
 @pytest.mark.asyncio

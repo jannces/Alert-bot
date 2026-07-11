@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import enum
 
-from strategy.models import Candle, Direction, TradeLevels
+from strategy.models import Candle, Direction, SignalGrade, TradeLevels
 
 
 class ComparisonMode(str, enum.Enum):
@@ -135,6 +135,72 @@ def matches_prefilter(
         if candle_colors_valid(direction, c1, c2, c3):
             return direction
     return None
+
+
+def third_candle_overshoot_pct(direction: Direction, c3: Candle, level: float) -> float:
+    """How far Candle 3's close broke through the level, in percent.
+
+    0.0 means the third-candle rule is satisfied exactly.
+    """
+    if level <= 0:
+        return float("inf")
+    if direction is Direction.SHORT:
+        return max(0.0, (c3.close - level) / level * 100.0)
+    return max(0.0, (level - c3.close) / level * 100.0)
+
+
+def grade_pattern(
+    direction: Direction,
+    c1: Candle,
+    c2: Candle,
+    c3: Candle,
+    level: float,
+    *,
+    tolerance_pct: float,
+    near_miss_enabled: bool,
+    near_tolerance_pct: float,
+    near_overshoot_pct: float,
+) -> tuple[SignalGrade, tuple[tuple[str, str], ...]] | None:
+    """Grade a color-valid pattern as FULL, NEAR_MISS, or not a signal.
+
+    FULL: equal closes within ``tolerance_pct`` AND Candle 3 respects the
+    level exactly. NEAR_MISS: the stretched bounds still hold — closes within
+    ``near_tolerance_pct`` and any close beyond the level is at most
+    ``near_overshoot_pct``. Anything looser is not a signal at all.
+
+    Returns ``(grade, notes)`` where notes name each deviation, or ``None``.
+    This is the single source of truth for grading: the scan engine grades
+    with it and the final validator re-checks with it.
+    """
+    strictly_equal = equal_close(c1.close, c2.close, tolerance_pct)
+    overshoot = third_candle_overshoot_pct(direction, c3, level)
+    if strictly_equal and overshoot == 0.0:
+        return SignalGrade.FULL, ()
+    if not near_miss_enabled:
+        return None
+
+    notes: list[tuple[str, str]] = []
+    if not strictly_equal:
+        if not equal_close(c1.close, c2.close, near_tolerance_pct):
+            return None
+        diff_pct = abs(c1.close - c2.close) / c1.close * 100.0
+        notes.append(
+            (
+                "equal_close",
+                f"closes differ by {diff_pct:.3f}% (strict limit {tolerance_pct}%)",
+            )
+        )
+    if overshoot > 0.0:
+        if overshoot > near_overshoot_pct:
+            return None
+        notes.append(
+            (
+                "third_candle",
+                f"candle 3 closed {overshoot:.3f}% beyond the level "
+                f"(allowance {near_overshoot_pct}%)",
+            )
+        )
+    return SignalGrade.NEAR_MISS, tuple(notes)
 
 
 def sr_level_is_meaningful(
