@@ -4,8 +4,8 @@
 # (tokens) in the environment / .env — never in this file.
 
 app:
-  host: 0.0.0.0
-  port: 8080            # /health endpoint only
+  host: 127.0.0.1
+  port: 8081            # /health endpoint only
 
 exchange:
   name: MEXC

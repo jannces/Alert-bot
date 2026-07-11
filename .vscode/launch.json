@@ -1,0 +1,18 @@
+{
+    // Press F5 (or Run → Start Debugging) to launch the scanner.
+    // Secrets are read from the .env file in the project root.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run Tamad Scanner",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "args": ["--config", "config/config.yaml"],
+            "envFile": "${workspaceFolder}/.env",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}
