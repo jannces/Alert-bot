@@ -104,12 +104,22 @@ class MexcClient:
         The newest returned candle is usually the live (forming) bar — the
         caller is responsible for discarding unfinished candles by timestamp.
         """
+        end_s = int(time.time())
+        start_s = end_s - bars * timeframe_minutes * 60
+        return await self.fetch_klines_range(api_symbol, timeframe_minutes, start_s, end_s)
+
+    async def fetch_klines_range(
+        self, api_symbol: str, timeframe_minutes: int, start_s: int, end_s: int
+    ) -> list[Candle]:
+        """Candles in ``[start_s, end_s]`` (unix seconds), oldest first.
+
+        MEXC caps one response at roughly 2000 points; callers wanting longer
+        spans (the backtester) chunk their requests.
+        """
         interval = _INTERVAL_BY_MINUTES.get(timeframe_minutes)
         if interval is None:
             raise ValueError(f"unsupported timeframe: {timeframe_minutes} minutes")
 
-        end_s = int(time.time())
-        start_s = end_s - bars * timeframe_minutes * 60
         data = await self._get_json(
             f"/api/v1/contract/kline/{api_symbol}",
             params={"interval": interval, "start": start_s, "end": end_s},
@@ -120,6 +130,7 @@ class MexcClient:
         highs = payload.get("high") or []
         lows = payload.get("low") or []
         closes = payload.get("close") or []
+        volumes = payload.get("vol") or []
         count = min(len(times), len(opens), len(highs), len(lows), len(closes))
 
         candles = [
@@ -129,6 +140,7 @@ class MexcClient:
                 high=float(highs[i]),
                 low=float(lows[i]),
                 close=float(closes[i]),
+                volume=float(volumes[i]) if i < len(volumes) else 0.0,
             )
             for i in range(count)
         ]

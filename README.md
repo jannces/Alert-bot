@@ -163,6 +163,24 @@ configured `on_failure` policy applies.
   *before* sending and survive restarts; a sent setup can never repeat.
 - **Operational logs:** rotating structured logs in `logs/tamad.log`.
 
+## Backtesting confirmations
+
+Before adding any confirmation filter to the live strategy, measure it:
+
+```bash
+python -m backtest.runner                    # 40 crypto majors, 15m, 90 days
+python -m backtest.runner --days 60 --tf 60  # robustness check on 1h
+```
+
+The runner replays the **exact live detection code** over real MEXC history
+and prints, per candidate confirmation (wick sweep, EMA-200 trend, volume
+surge, RSI extreme, minimum range, the S/R filter, and combinations): signal
+count, win rate and expectancy (in R) for TP2 and TP3 exits, and timeouts.
+Simulation is conservative — when one bar spans both the stop and the
+target, it counts as a loss. Results are gross (no fees/funding/slippage);
+2R breakeven is a 33.4% win rate, 3R is 25.0%. Data is cached under
+`backtest/cache/` so re-runs are free.
+
 ## Debugging: how close are near-misses getting?
 
 If alerts feel too rare, don't guess — check the data. While the scanner is

@@ -65,6 +65,7 @@ class Candle:
     high: float
     low: float
     close: float
+    volume: float = 0.0
 
     @property
     def is_green(self) -> bool:

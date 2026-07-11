@@ -14,3 +14,4 @@ logs/*
 !logs/.gitkeep
 database/*.sqlite3*
 screenshots/out/
+backtest/cache/
