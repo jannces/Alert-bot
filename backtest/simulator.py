@@ -99,6 +99,54 @@ def simulate_exit(
     return Outcome.TIMEOUT, last - entry_index
 
 
+def simulate_scaled_exit(
+    candles: Sequence[Candle],
+    entry_index: int,
+    direction: Direction,
+    entry: float,
+    stop_loss: float,
+    risk: float,
+    horizon_bars: int,
+) -> tuple[str, float]:
+    """Scaled exit: half off at +1R, stop to breakeven, rest targets +2R.
+
+    Outcomes (conservative at every ambiguity):
+      loss    −1.0R  stop hit before +1R
+      scratch +0.5R  +1R banked, remainder stopped at breakeven (or timed out)
+      win     +1.5R  +1R banked, remainder reached +2R
+      timeout  0.0R  neither stop nor +1R within the horizon (excluded)
+    """
+    short = direction is Direction.SHORT
+    tp1 = entry - risk if short else entry + risk
+    tp2 = entry - 2 * risk if short else entry + 2 * risk
+    last = min(len(candles) - 1, entry_index + horizon_bars)
+
+    # Phase 1: race between the stop and +1R.
+    phase2_start = None
+    for j in range(entry_index + 1, last + 1):
+        bar = candles[j]
+        hit_stop = bar.high >= stop_loss if short else bar.low <= stop_loss
+        hit_tp1 = bar.low <= tp1 if short else bar.high >= tp1
+        if hit_stop:  # conservative: stop wins any tie
+            return "loss", -1.0
+        if hit_tp1:
+            phase2_start = j
+            break
+    if phase2_start is None:
+        return "timeout", 0.0
+
+    # Phase 2: remainder runs with the stop at breakeven (entry).
+    for j in range(phase2_start, last + 1):
+        bar = candles[j]
+        hit_be = bar.high >= entry if short else bar.low <= entry
+        hit_tp2 = bar.low <= tp2 if short else bar.high >= tp2
+        if hit_be:  # conservative: breakeven wins any tie (incl. the +1R bar)
+            return "scratch", 0.5
+        if hit_tp2:
+            return "win", 1.5
+    return "scratch", 0.5  # horizon reached with half banked
+
+
 @dataclass
 class VariantResult:
     """Aggregate statistics for one filter combination."""
@@ -130,3 +178,31 @@ class VariantResult:
         """Average R per trade exiting fully at TP3 (win +3R, loss −1R)."""
         wr = self.win_rate_3r
         return None if wr is None else wr * 3.0 - (1.0 - wr)
+
+
+@dataclass
+class ScaledResult:
+    """Aggregate statistics for the scaled exit (half at 1R → BE, rest 2R)."""
+
+    name: str
+    signals: int = 0
+    losses: int = 0
+    scratches: int = 0
+    wins: int = 0
+    timeouts: int = 0
+    total_r: float = 0.0
+
+    @property
+    def resolved(self) -> int:
+        return self.losses + self.scratches + self.wins
+
+    @property
+    def profitable_rate(self) -> float | None:
+        """Fraction of resolved trades ending green (+0.5R or +1.5R)."""
+        if not self.resolved:
+            return None
+        return (self.scratches + self.wins) / self.resolved
+
+    @property
+    def expectancy(self) -> float | None:
+        return self.total_r / self.resolved if self.resolved else None

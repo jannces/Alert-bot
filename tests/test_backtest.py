@@ -12,6 +12,7 @@ from backtest.simulator import (
     Outcome,
     detect_signals,
     simulate_exit,
+    simulate_scaled_exit,
 )
 from strategy.models import Candle, Direction
 from strategy.tamad_strategy import ComparisonMode, compute_trade_levels
@@ -99,6 +100,54 @@ class TestSimulateExit:
         candles = self._series((112.0, 107.5), (118.0, 111.0))
         outcome, _ = simulate_exit(candles, len(candles) - 3, Direction.LONG, 107.0, 117.5, 100)
         assert outcome is Outcome.WIN
+
+
+class TestScaledExit:
+    """Fixture SHORT: entry 109.5, SL 113.0, risk 3.5 → +1R=106.0, +2R=102.5."""
+
+    def _series(self, *bars: tuple[float, float]) -> list[Candle]:
+        candles = series_with_short_pattern()
+        i = len(candles)
+        for high, low in bars:
+            mid = (high + low) / 2
+            candles.append(Candle(i * TF_MS, mid, high, low, mid))
+            i += 1
+        return candles
+
+    def _run(self, candles, entry_index):
+        return simulate_scaled_exit(
+            candles, entry_index, Direction.SHORT, 109.5, 113.0, 3.5, 100
+        )
+
+    def test_stop_before_1r_is_full_loss(self):
+        candles = self._series((113.5, 108.0))
+        assert self._run(candles, len(candles) - 2) == ("loss", -1.0)
+
+    def test_1r_then_breakeven_is_a_scratch(self):
+        # +1R touched (low 105.5), then price returns to entry (high 110).
+        candles = self._series((108.0, 105.5), (110.0, 107.0))
+        label, r = self._run(candles, len(candles) - 3)
+        assert (label, r) == ("scratch", 0.5)
+
+    def test_1r_then_2r_without_breakeven_touch_is_a_win(self):
+        candles = self._series((107.0, 105.5), (106.0, 102.0))
+        label, r = self._run(candles, len(candles) - 3)
+        assert (label, r) == ("win", 1.5)
+
+    def test_1r_bar_that_also_touches_entry_is_a_scratch(self):
+        # Conservative: the +1R bar's high also reaches entry → scratch.
+        candles = self._series((110.0, 105.5), (104.0, 102.0))
+        label, r = self._run(candles, len(candles) - 3)
+        assert (label, r) == ("scratch", 0.5)
+
+    def test_horizon_after_1r_banks_the_half(self):
+        candles = self._series((107.0, 105.5), (107.5, 104.0))
+        label, r = self._run(candles, len(candles) - 3)
+        assert (label, r) == ("scratch", 0.5)
+
+    def test_no_touch_within_horizon_is_timeout(self):
+        candles = self._series((110.0, 107.0), (110.5, 107.5))
+        assert self._run(candles, len(candles) - 3) == ("timeout", 0.0)
 
 
 def make_context(candles: list[Candle], direction=Direction.SHORT, level=110.0):

@@ -20,7 +20,14 @@ import logging
 
 from backtest import filters as f
 from backtest.data import HistoricalDataLoader
-from backtest.simulator import Outcome, VariantResult, detect_signals, simulate_exit
+from backtest.simulator import (
+    Outcome,
+    ScaledResult,
+    VariantResult,
+    detect_signals,
+    simulate_exit,
+    simulate_scaled_exit,
+)
 from config.settings import MexcSettings
 from mexc.client import MexcClient
 from strategy.models import Candle
@@ -109,6 +116,71 @@ def run_variants(
     return list(results.values())
 
 
+def run_scaled_variants(
+    data: dict[str, list[Candle]],
+    tolerance_pct: float,
+    mode: ComparisonMode,
+    horizon_bars: int,
+) -> list[ScaledResult]:
+    variants = build_variants()
+    results = {name: ScaledResult(name) for name in variants}
+
+    for symbol, candles in data.items():
+        for signal in detect_signals(candles, tolerance_pct, mode, WARMUP_BARS):
+            ctx = f.FilterContext(
+                candles=candles[: signal.index + 1],
+                direction=signal.direction,
+                level=signal.level,
+                levels=signal.levels,
+            )
+            label, r_value = simulate_scaled_exit(
+                candles, signal.index, signal.direction,
+                signal.levels.entry, signal.levels.stop_loss,
+                signal.levels.risk, horizon_bars,
+            )
+            for name, confirmations in variants.items():
+                if not all(check(ctx) for check in confirmations):
+                    continue
+                r = results[name]
+                r.signals += 1
+                if label == "timeout":
+                    r.timeouts += 1
+                    continue
+                r.total_r += r_value
+                if label == "loss":
+                    r.losses += 1
+                elif label == "scratch":
+                    r.scratches += 1
+                else:
+                    r.wins += 1
+    return list(results.values())
+
+
+def print_scaled_report(
+    results: list[ScaledResult], days: int, tf: int, symbols: int
+) -> None:
+    print(
+        f"\nTamad SCALED-EXIT backtest — {symbols} symbols, {tf}m, last {days} days"
+    )
+    print("(half off at +1R, stop to breakeven, rest targets +2R;")
+    print(" profitable% counts +0.5R scratches and +1.5R wins)\n")
+    header = (
+        f"{'variant':<28} {'signals':>7} {'profit%':>8} {'full-win%':>9} "
+        f"{'exp(R)':>7} {'t/o':>5}"
+    )
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        prof = "  n/a" if r.profitable_rate is None else f"{r.profitable_rate:7.1%}"
+        winr = "  n/a" if not r.resolved else f"{r.wins / r.resolved:8.1%}"
+        exp = "  n/a" if r.expectancy is None else f"{r.expectancy:+7.2f}"
+        print(f"{r.name:<28} {r.signals:>7} {prof:>8} {winr:>9} {exp:>7} {r.timeouts:>5}")
+    print(
+        "\nSame caveats as the fixed-exit report; every intrabar ambiguity is\n"
+        "resolved against the trade, so these are worst-case numbers."
+    )
+
+
 def print_report(results: list[VariantResult], days: int, tf: int, symbols: int) -> None:
     print(f"\nTamad confirmation backtest — {symbols} symbols, {tf}m, last {days} days")
     print("(2R breakeven win rate: 33.4%; 3R breakeven: 25.0% — before fees)\n")
@@ -154,6 +226,11 @@ async def main() -> None:
         choices=["conservative", "optimistic"],
         help="same-bar stop+target resolution; run both to bracket the truth",
     )
+    parser.add_argument(
+        "--exit", default="fixed", choices=["fixed", "scaled"],
+        help="fixed = all-out at TP2/TP3; scaled = half at +1R, stop to "
+        "breakeven, rest to +2R (higher realized win rate)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -172,12 +249,21 @@ async def main() -> None:
     if not data:
         raise SystemExit("no data loaded — is contract.mexc.com reachable?")
 
-    results = run_variants(
-        data, args.tolerance, ComparisonMode(args.mode), args.horizon,
-        optimistic=args.ambiguity == "optimistic",
+    print(
+        f"\n[mode={args.mode}, tolerance={args.tolerance}%, "
+        f"ambiguity={args.ambiguity}, exit={args.exit}]"
     )
-    print(f"\n[mode={args.mode}, tolerance={args.tolerance}%, ambiguity={args.ambiguity}]")
-    print_report(results, args.days, args.tf, len(data))
+    if args.exit == "scaled":
+        scaled = run_scaled_variants(
+            data, args.tolerance, ComparisonMode(args.mode), args.horizon
+        )
+        print_scaled_report(scaled, args.days, args.tf, len(data))
+    else:
+        results = run_variants(
+            data, args.tolerance, ComparisonMode(args.mode), args.horizon,
+            optimistic=args.ambiguity == "optimistic",
+        )
+        print_report(results, args.days, args.tf, len(data))
 
 
 if __name__ == "__main__":
