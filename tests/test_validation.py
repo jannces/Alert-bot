@@ -7,8 +7,9 @@ from dataclasses import replace
 import pytest
 
 from config.settings import Settings
+from strategy.models import SRKind, SRLevel
 from strategy.validation import FinalValidator
-from tests.fixtures import NOW_MS, TF_MS, make_short_setup
+from tests.fixtures import NOW_MS, TF_MS, make_long_setup, make_short_setup
 
 
 @pytest.fixture()
@@ -21,6 +22,14 @@ def validator(settings: Settings) -> FinalValidator:
     return FinalValidator(settings, now_ms=lambda: NOW_MS)
 
 
+@pytest.fixture()
+def sr_validator() -> FinalValidator:
+    """Validator with the (optional) S/R confirmation switched on."""
+    settings = Settings()
+    settings.strategy.support_resistance.enabled = True
+    return FinalValidator(settings, now_ms=lambda: NOW_MS)
+
+
 def failed_names(report) -> set[str]:
     return {check.name for check in report.failed_checks}
 
@@ -30,20 +39,37 @@ class TestValidSetup:
         report = validator.validate(make_short_setup())
         assert report.passed, report.summary()
 
+    def test_rule_perfect_long_passes_every_check(self, validator):
+        report = validator.validate(make_long_setup())
+        assert report.passed, report.summary()
+
     def test_report_contains_all_mandatory_checks(self, validator):
         report = validator.validate(make_short_setup())
         names = {check.name for check in report.checks}
         assert {
-            "candle_colors",
+            "candle1_color",
+            "candle2_color",
+            "candle3_color",
             "equal_close",
             "third_candle_rule",
-            "sr_proximity",
             "candle3_closed",
+            "signal_fresh",
             "entry_price",
             "stop_loss",
             "tp2",
             "tp3",
         } <= names
+
+    def test_sr_checks_only_run_when_filter_enabled(self, validator, sr_validator):
+        default_names = {c.name for c in validator.validate(make_short_setup()).checks}
+        assert not {"sr_present", "sr_side", "sr_proximity"} & default_names
+
+        sr_names = {c.name for c in sr_validator.validate(make_short_setup()).checks}
+        assert {"sr_present", "sr_side", "sr_proximity"} <= sr_names
+
+    def test_middle_of_range_passes_when_sr_disabled(self, validator):
+        # S/R confirmation off: a pattern with no nearby level is valid.
+        assert validator.validate(make_short_setup(sr=None)).passed
 
 
 class TestRejections:
@@ -54,7 +80,6 @@ class TestRejections:
 
     def test_tampered_stop_loss_rejected(self, validator):
         report = validator.validate(make_short_setup(stop_loss=112.0))
-        assert not report.passed
         assert "stop_loss" in failed_names(report)
 
     def test_tampered_targets_rejected(self, validator):
@@ -70,22 +95,28 @@ class TestRejections:
     def test_stale_signal_rejected(self, settings):
         late = FinalValidator(
             settings,
-            now_ms=lambda: NOW_MS + settings.app.max_alert_age_seconds * 1000 + 60_000,
+            now_ms=lambda: NOW_MS
+            + settings.scanner.max_signal_age_seconds * 1000
+            + 60_000,
         )
         report = late.validate(make_short_setup())
         assert "signal_fresh" in failed_names(report)
 
-    def test_unknown_sr_type_rejected(self, validator):
-        report = validator.validate(make_short_setup(sr_type="round_number"))
-        assert "sr_type_allowed" in failed_names(report)
+    def test_missing_sr_rejected_when_filter_enabled(self, sr_validator):
+        report = sr_validator.validate(make_short_setup(sr=None))
+        assert "sr_present" in failed_names(report)
 
-    def test_sr_on_wrong_side_rejected(self, validator):
+    def test_sr_on_wrong_side_rejected(self, sr_validator):
         # A swing LOW is not resistance for a SHORT.
-        report = validator.validate(make_short_setup(sr_type="swing_low"))
+        report = sr_validator.validate(
+            make_short_setup(sr=SRLevel(kind=SRKind.SWING_LOW, price=110.05))
+        )
         assert "sr_side" in failed_names(report)
 
-    def test_sr_too_far_from_pattern_rejected(self, validator):
-        report = validator.validate(make_short_setup(sr_level=113.0))
+    def test_sr_too_far_from_pattern_rejected(self, sr_validator):
+        report = sr_validator.validate(
+            make_short_setup(sr=SRLevel(kind=SRKind.SWING_HIGH, price=113.0))
+        )
         assert "sr_proximity" in failed_names(report)
 
     def test_close_through_resistance_rejected(self, validator):
@@ -96,30 +127,30 @@ class TestRejections:
         )
         assert "third_candle_rule" in failed_names(report)
 
-    def test_wrong_timeframe_rejected(self, validator):
-        report = validator.validate(make_short_setup(timeframe_minutes=5))
-        assert "timeframe_allowed" in failed_names(report)
-
-    def test_non_usdt_perp_symbol_rejected(self, validator):
-        report = validator.validate(make_short_setup(symbol="BTCUSD"))
-        assert "usdt_perpetual" in failed_names(report)
-
-    def test_symbol_outside_whitelist_rejected(self, settings):
-        settings.scanner.symbols.mode = "whitelist"
-        settings.scanner.symbols.whitelist = ["ETHUSDT.P"]
-        validator = FinalValidator(settings, now_ms=lambda: NOW_MS)
-        report = validator.validate(make_short_setup())
-        assert "symbol_allowed" in failed_names(report)
-
-    def test_out_of_order_candles_rejected(self, validator):
+    def test_wrong_candle_color_rejected(self, validator):
         setup = make_short_setup()
-        swapped = make_short_setup(candle1=setup.candle2, candle2=setup.candle1)
-        report = validator.validate(swapped)
+        red_c3 = replace(setup.candle3, open=110.9, close=109.5)
+        report = validator.validate(make_short_setup(candle3=red_c3))
+        assert "candle3_color" in failed_names(report)
+
+    def test_non_consecutive_candles_rejected(self, validator):
+        setup = make_short_setup()
+        gapped = replace(setup.candle3, open_time_ms=setup.candle3.open_time_ms + TF_MS)
+        report = validator.validate(make_short_setup(candle3=gapped))
         assert "candle_order" in failed_names(report)
 
-    def test_reported_level_mismatch_rejected(self, validator):
+    def test_level_inconsistency_rejected(self, validator):
         report = validator.validate(make_short_setup(level=110.02))
-        assert "level_matches" in failed_names(report)
+        assert "level_consistency" in failed_names(report)
+
+    def test_midpoint_mode_changes_the_level(self, settings):
+        settings.strategy.equal_close.comparison_mode = "midpoint"
+        validator = FinalValidator(settings, now_ms=lambda: NOW_MS)
+        # strict level (110.0) no longer matches the midpoint (110.01).
+        assert "level_consistency" in failed_names(
+            validator.validate(make_short_setup())
+        )
+        assert validator.validate(make_short_setup(level=110.01)).passed
 
 
 class TestReportSummary:
@@ -127,3 +158,8 @@ class TestReportSummary:
         report = validator.validate(make_short_setup(entry=1.0))
         assert not report.passed
         assert "entry_price" in report.summary()
+
+    def test_passed_and_failed_names_split(self, validator):
+        report = validator.validate(make_short_setup(tp2=1.0))
+        assert "tp2" in report.failed_names
+        assert "equal_close" in report.passed_names

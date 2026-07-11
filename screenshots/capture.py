@@ -1,21 +1,12 @@
-"""TradingView chart screenshot capture.
+"""TradingView chart capture + Python-drawn annotation (D1).
 
-Two providers are available; both render the actual TradingView chart so the
-image in Telegram is the exact chart you would analyze by hand:
+``ScreenshotService`` is the pipeline-facing façade: given a validated
+setup it captures the owner's saved TradingView layout with Playwright,
+calibrates the pixel↔price mapping, draws the annotations with Pillow
+(:mod:`screenshots.annotate`), persists the PNG to disk, and returns both
+the bytes (for Telegram) and the file path (for the signal snapshot).
 
-``playwright``
-    Opens your own TradingView chart layout in headless Chromium and
-    screenshots it. Point ``chart_url`` at a saved layout that has the Tamad
-    Pine indicator applied — the indicator draws the three highlighted
-    candles, the S/R line, entry, stop, TP2 and TP3 directly on the chart, so
-    the screenshot contains every required annotation. For private layouts,
-    export a Playwright ``storage_state.json`` once after logging in.
-
-``chart_img``
-    Uses the chart-img.com TradingView snapshot API (API key required) as a
-    lighter-weight alternative when running a browser is not desirable.
-
-Failures never raise into the alert pipeline: ``capture`` returns ``None``
+Failures never raise into the alert pipeline: ``render`` returns ``None``
 and the pipeline applies the configured ``on_failure`` policy.
 """
 
@@ -24,57 +15,72 @@ from __future__ import annotations
 import abc
 import asyncio
 import logging
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
-import httpx
-
 from config.settings import ScreenshotSettings
+from screenshots import annotate
+from screenshots.annotate import ChartCalibration
+from screenshots.calibration import calibrate
+from strategy.models import TamadSetup
 
 logger = logging.getLogger(__name__)
 
+_DEVICE_SCALE = 2.0
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedScreenshot:
+    """Final annotated chart image, ready for Telegram + the database."""
+
+    image: bytes
+    file_path: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RawCapture:
+    image: bytes
+    calibration: ChartCalibration | None
+
 
 class ScreenshotProvider(abc.ABC):
-    """Captures a chart image for a symbol/interval pair."""
+    """Captures a raw chart image (plus calibration when possible)."""
 
     @abc.abstractmethod
-    async def capture(self, tv_symbol: str, interval: str) -> bytes | None:
-        """Return PNG bytes, or None when capture fails."""
+    async def capture(self, tv_symbol: str, setup: TamadSetup) -> RawCapture | None: ...
 
     async def aclose(self) -> None:  # pragma: no cover - trivial default
         return None
 
 
 class DisabledProvider(ScreenshotProvider):
-    async def capture(self, tv_symbol: str, interval: str) -> bytes | None:
+    async def capture(self, tv_symbol: str, setup: TamadSetup) -> RawCapture | None:
         return None
 
 
 class PlaywrightProvider(ScreenshotProvider):
-    """Headless-Chromium screenshot of a real TradingView chart layout."""
+    """Headless-Chromium capture of the owner's saved TradingView layout."""
 
     def __init__(self, settings: ScreenshotSettings) -> None:
         self._cfg = settings.playwright
 
-    async def capture(self, tv_symbol: str, interval: str) -> bytes | None:
+    async def capture(self, tv_symbol: str, setup: TamadSetup) -> RawCapture | None:
         for attempt in range(1, self._cfg.retries + 2):
             try:
                 return await asyncio.wait_for(
-                    self._capture_once(tv_symbol, interval),
+                    self._capture_once(tv_symbol, setup),
                     timeout=self._cfg.timeout_seconds,
                 )
             except Exception as exc:  # noqa: BLE001 - never break the pipeline
                 logger.warning(
-                    "screenshot attempt %d for %s %s failed: %s",
-                    attempt,
-                    tv_symbol,
-                    interval,
-                    exc,
+                    "screenshot attempt %d for %s failed: %s", attempt, tv_symbol, exc
                 )
-        logger.error("all screenshot attempts failed for %s %s", tv_symbol, interval)
+        logger.error("all screenshot attempts failed for %s", tv_symbol)
         return None
 
-    async def _capture_once(self, tv_symbol: str, interval: str) -> bytes:
+    async def _capture_once(self, tv_symbol: str, setup: TamadSetup) -> RawCapture:
         # Imported lazily so the dependency is only needed when this
         # provider is actually configured.
         from playwright.async_api import async_playwright
@@ -82,7 +88,7 @@ class PlaywrightProvider(ScreenshotProvider):
         separator = "&" if "?" in self._cfg.chart_url else "?"
         url = (
             f"{self._cfg.chart_url}{separator}"
-            f"symbol={quote(tv_symbol)}&interval={quote(interval)}"
+            f"symbol={quote(tv_symbol)}&interval={quote(setup.tv_interval)}"
         )
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
@@ -97,63 +103,78 @@ class PlaywrightProvider(ScreenshotProvider):
                         "width": self._cfg.viewport.width,
                         "height": self._cfg.viewport.height,
                     },
-                    device_scale_factor=2,
+                    device_scale_factor=_DEVICE_SCALE,
                     storage_state=storage if storage and Path(storage).exists() else None,
                 )
                 page = await context.new_page()
                 await page.goto(url, wait_until="domcontentloaded")
                 await page.wait_for_selector("canvas", timeout=30_000)
-                # Give TradingView time to stream data and paint the chart
-                # (including the Pine indicator's pattern drawings).
+                # Let TradingView stream data and finish painting.
                 await page.wait_for_timeout(int(self._cfg.render_wait_seconds * 1000))
+
                 chart = page.locator(".chart-container").first
-                if await chart.count():
-                    return await chart.screenshot(type="png")
-                return await page.screenshot(type="png")
+                pane_box = await chart.bounding_box() if await chart.count() else None
+
+                calibration = None
+                if pane_box is not None:
+                    calibration = await calibrate(page, pane_box, setup, _DEVICE_SCALE)
+                    # Park the cursor so no crosshair pollutes the screenshot.
+                    await page.mouse.move(1, 1)
+                    await page.wait_for_timeout(150)
+
+                if pane_box is not None:
+                    image = await chart.screenshot(type="png")
+                else:
+                    image = await page.screenshot(type="png")
+                return RawCapture(image=image, calibration=calibration)
             finally:
                 await browser.close()
 
 
-class ChartImgProvider(ScreenshotProvider):
-    """Screenshot via the chart-img.com TradingView snapshot API."""
+class ScreenshotService:
+    """Capture → annotate → persist. The pipeline's single entry point."""
 
-    def __init__(self, settings: ScreenshotSettings) -> None:
-        self._cfg = settings.chart_img
-        if not self._cfg.api_key:
-            raise ValueError("chart_img provider selected but api_key is empty")
-        self._client = httpx.AsyncClient(timeout=self._cfg.timeout_seconds)
+    def __init__(self, settings: ScreenshotSettings, tv_prefix: str) -> None:
+        self._settings = settings
+        self._tv_prefix = tv_prefix
+        self._provider: ScreenshotProvider = (
+            PlaywrightProvider(settings)
+            if settings.provider == "playwright"
+            else DisabledProvider()
+        )
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        await self._provider.aclose()
 
-    async def capture(self, tv_symbol: str, interval: str) -> bytes | None:
-        payload = {
-            "symbol": tv_symbol,
-            "interval": f"{interval}m" if interval.isdigit() else interval,
-            "width": self._cfg.width,
-            "height": self._cfg.height,
-        }
+    async def render(self, setup: TamadSetup) -> RenderedScreenshot | None:
+        tv_symbol = f"{self._tv_prefix}:{setup.symbol}"
+        raw = await self._provider.capture(tv_symbol, setup)
+        if raw is None:
+            return None
+
         try:
-            response = await self._client.post(
-                self._cfg.base_url,
-                json=payload,
-                headers={"x-api-key": self._cfg.api_key},
+            image = annotate.render(
+                raw.image, setup, raw.calibration, self._settings.annotations
             )
-            if response.status_code == 200:
-                return response.content
-            logger.error(
-                "chart-img returned HTTP %s: %s",
-                response.status_code,
-                response.text[:300],
+        except Exception:  # noqa: BLE001 - a bad overlay must not lose the chart
+            logger.exception("annotation failed for %s; using raw capture", tv_symbol)
+            image = raw.image
+
+        return RenderedScreenshot(image=image, file_path=self._persist(setup, image))
+
+    def _persist(self, setup: TamadSetup, image: bytes) -> str | None:
+        try:
+            out_dir = Path(self._settings.output_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = setup.detected_at.strftime("%Y%m%d_%H%M%S")
+            safe_pair = re.sub(r"[^A-Za-z0-9]+", "", setup.pair)
+            name = (
+                f"{stamp}_{safe_pair}_{setup.timeframe_minutes}m_"
+                f"{setup.direction.value}.png"
             )
-        except httpx.HTTPError as exc:
-            logger.error("chart-img request failed: %s", exc)
-        return None
-
-
-def create_provider(settings: ScreenshotSettings) -> ScreenshotProvider:
-    if settings.provider == "playwright":
-        return PlaywrightProvider(settings)
-    if settings.provider == "chart_img":
-        return ChartImgProvider(settings)
-    return DisabledProvider()
+            path = out_dir / name
+            path.write_bytes(image)
+            return str(path)
+        except OSError:
+            logger.exception("could not persist screenshot for %s", setup.symbol)
+            return None

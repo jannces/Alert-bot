@@ -13,3 +13,4 @@ config/tv_storage_state.json
 logs/*
 !logs/.gitkeep
 database/*.sqlite3*
+screenshots/out/

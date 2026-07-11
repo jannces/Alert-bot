@@ -4,11 +4,20 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from strategy.models import Candle, Direction, TamadSetup
+from strategy.models import (
+    Candle,
+    CheckResult,
+    Direction,
+    SRKind,
+    SRLevel,
+    TamadSetup,
+    ValidationReport,
+)
 
 TF_MINUTES = 15
 TF_MS = TF_MINUTES * 60_000
-T0 = 1_760_000_000_000  # arbitrary bar-open time (ms)
+# Bar-open time aligned to a 15m boundary (multiple of 900,000 ms).
+T0 = 1_759_999_500_000
 
 # Candle 3 close time, and a "now" a few seconds after it.
 CANDLE3_CLOSE_MS = T0 + 3 * TF_MS
@@ -47,40 +56,40 @@ def make_short_setup(**overrides) -> TamadSetup:
         candle2=c2,
         candle3=c3,
         level=110.0,
-        sr_type="swing_high",
-        sr_level=110.05,
+        sr=SRLevel(kind=SRKind.SWING_HIGH, price=110.05),
         entry=109.5,
         stop_loss=113.0,
+        risk=3.5,
         tp2=102.5,
         tp3=99.0,
         detected_at=datetime.fromtimestamp(CANDLE3_CLOSE_MS / 1000, tz=timezone.utc),
-        raw_payload={},
     )
     fields.update(overrides)
     return TamadSetup(**fields)
 
 
-def short_payload_dict(secret: str = "test-secret") -> dict:
-    """A valid webhook payload matching :func:`make_short_setup`."""
-    c1, c2, c3 = short_candles()
-    return {
-        "secret": secret,
-        "strategy": "TAMAD",
-        "version": 1,
-        "exchange": "MEXC",
-        "symbol": "BTCUSDT.P",
-        "timeframe": "15",
-        "direction": "SHORT",
-        "level": 110.0,
-        "sr_type": "swing_high",
-        "sr_level": 110.05,
-        "candles": [
-            {"t": c.open_time_ms, "o": c.open, "h": c.high, "l": c.low, "c": c.close}
-            for c in (c1, c2, c3)
-        ],
-        "entry": 109.5,
-        "sl": 113.0,
-        "tp2": 102.5,
-        "tp3": 99.0,
-        "detected_at_ms": CANDLE3_CLOSE_MS,
-    }
+def make_long_setup(**overrides) -> TamadSetup:
+    c1, c2, c3 = long_candles()
+    fields = dict(
+        exchange="MEXC",
+        symbol="ETHUSDT.P",
+        timeframe_minutes=TF_MINUTES,
+        direction=Direction.LONG,
+        candle1=c1,
+        candle2=c2,
+        candle3=c3,
+        level=110.02,
+        sr=SRLevel(kind=SRKind.SWING_LOW, price=109.9),
+        entry=110.5,
+        stop_loss=107.0,
+        risk=3.5,
+        tp2=117.5,
+        tp3=121.0,
+        detected_at=datetime.fromtimestamp(CANDLE3_CLOSE_MS / 1000, tz=timezone.utc),
+    )
+    fields.update(overrides)
+    return TamadSetup(**fields)
+
+
+def passing_report() -> ValidationReport:
+    return ValidationReport((CheckResult("example", True, ""),))

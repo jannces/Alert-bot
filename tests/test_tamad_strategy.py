@@ -6,11 +6,11 @@ from dataclasses import replace
 
 from strategy.models import Candle, Direction
 from strategy.tamad_strategy import (
-    LevelBasis,
+    ComparisonMode,
     candle_colors_valid,
     compute_trade_levels,
-    detect_pattern,
     equal_close,
+    matches_prefilter,
     pattern_level,
     sr_level_is_meaningful,
     third_candle_respects_level,
@@ -41,17 +41,18 @@ class TestEqualClose:
 
 class TestPatternLevel:
     def test_short_strict_uses_lower_close(self):
-        assert pattern_level(Direction.SHORT, 110.0, 110.02, LevelBasis.STRICT) == 110.0
+        assert pattern_level(Direction.SHORT, 110.0, 110.02, ComparisonMode.STRICT) == 110.0
 
     def test_long_strict_uses_higher_close(self):
-        assert pattern_level(Direction.LONG, 110.0, 110.02, LevelBasis.STRICT) == 110.02
+        assert pattern_level(Direction.LONG, 110.0, 110.02, ComparisonMode.STRICT) == 110.02
 
-    def test_outer_is_mirror_of_strict(self):
-        assert pattern_level(Direction.SHORT, 110.0, 110.02, LevelBasis.OUTER) == 110.02
-        assert pattern_level(Direction.LONG, 110.0, 110.02, LevelBasis.OUTER) == 110.0
+    def test_midpoint_is_middle_of_closes(self):
+        assert pattern_level(Direction.SHORT, 100.0, 102.0, ComparisonMode.MIDPOINT) == 101.0
+        assert pattern_level(Direction.LONG, 100.0, 102.0, ComparisonMode.MIDPOINT) == 101.0
 
-    def test_avg_is_midpoint(self):
-        assert pattern_level(Direction.SHORT, 100.0, 102.0, LevelBasis.AVG) == 101.0
+    def test_average_mode_does_not_exist(self):
+        # D2: "average" ≡ midpoint with two candles, so it was dropped.
+        assert [m.value for m in ComparisonMode] == ["strict", "midpoint"]
 
 
 class TestCandleColors:
@@ -98,7 +99,7 @@ class TestTradeLevels:
     def test_short_levels(self):
         c1, c2, c3 = short_candles()
         levels = compute_trade_levels(Direction.SHORT, c1, c2, c3)
-        assert levels.entry == 109.5  # candle 3 close
+        assert levels.entry == 109.5  # candle 3 close — never anything else
         assert levels.stop_loss == 113.0  # highest wick of the three candles
         assert levels.risk == 3.5
         assert levels.tp2 == 102.5  # entry - 2R
@@ -114,54 +115,47 @@ class TestTradeLevels:
         assert levels.tp3 == 121.0
 
 
-class TestDetectPattern:
-    def test_valid_short_detected(self):
-        result = detect_pattern(short_candles(), TOL)
-        assert result is not None
-        direction, level, levels = result
-        assert direction is Direction.SHORT
-        assert level == 110.0
-        assert levels.stop_loss == 113.0
+class TestPrefilter:
+    """The candidate pre-filter: colors + equal close (near-miss boundary)."""
 
-    def test_valid_long_detected(self):
-        result = detect_pattern(long_candles(), TOL)
-        assert result is not None
-        direction, level, _ = result
-        assert direction is Direction.LONG
-        assert level == 110.02
+    def test_short_pattern_detected(self):
+        c1, c2, c3 = short_candles()
+        assert matches_prefilter(c1, c2, c3, TOL) is Direction.SHORT
 
-    def test_unequal_closes_rejected(self):
+    def test_long_pattern_detected(self):
+        c1, c2, c3 = long_candles()
+        assert matches_prefilter(c1, c2, c3, TOL) is Direction.LONG
+
+    def test_unequal_closes_not_a_candidate(self):
         c1, c2, c3 = short_candles()
         c2 = replace(c2, close=111.0)  # ~0.9% away — far beyond tolerance
-        assert detect_pattern((c1, c2, c3), TOL) is None
+        assert matches_prefilter(c1, c2, c3, TOL) is None
 
-    def test_close_through_level_rejected(self):
-        c1, c2, c3 = short_candles()
-        c3 = replace(c3, close=110.5, high=112.0)  # closes above resistance
-        assert detect_pattern((c1, c2, c3), TOL) is None
-
-    def test_wrong_colors_rejected(self):
+    def test_wrong_colors_not_a_candidate(self):
         c1, c2, c3 = short_candles()
         c3 = replace(c3, open=110.9, close=109.5)  # red third candle on a SHORT
-        assert detect_pattern((c1, c2, c3), TOL) is None
+        assert matches_prefilter(c1, c2, c3, TOL) is None
 
-    def test_insane_ohlc_rejected(self):
+    def test_insane_ohlc_not_a_candidate(self):
         c1, c2, c3 = short_candles()
         c3 = replace(c3, high=1.0)  # high below the body
-        assert detect_pattern((c1, c2, c3), TOL) is None
+        assert matches_prefilter(c1, c2, c3, TOL) is None
 
-    def test_fewer_than_three_candles_rejected(self):
-        c1, c2, _ = short_candles()
-        assert detect_pattern((c1, c2), TOL) is None
+    def test_close_through_level_is_still_a_candidate(self):
+        # The third-candle rule is validated AFTER the pre-filter so its
+        # failure is logged as a near-miss rejection (decision D3).
+        c1, c2, c3 = short_candles()
+        c3 = replace(c3, close=110.5, high=112.0)
+        assert matches_prefilter(c1, c2, c3, TOL) is Direction.SHORT
 
 
 class TestSRProximity:
     def test_level_at_sr_passes(self):
-        assert sr_level_is_meaningful(110.0, 110.05, 0.15)
+        assert sr_level_is_meaningful(110.0, 110.05, 0.25)
 
     def test_middle_of_range_fails(self):
-        assert not sr_level_is_meaningful(110.0, 112.0, 0.15)
+        assert not sr_level_is_meaningful(110.0, 112.0, 0.25)
 
     def test_invalid_levels_fail(self):
-        assert not sr_level_is_meaningful(0.0, 110.0, 0.15)
-        assert not sr_level_is_meaningful(110.0, 0.0, 0.15)
+        assert not sr_level_is_meaningful(0.0, 110.0, 0.25)
+        assert not sr_level_is_meaningful(110.0, 0.0, 0.25)

@@ -1,11 +1,12 @@
 services:
   tamad-scanner:
     build: .
-    restart: unless-stopped        # automatic recovery after any failure
+    restart: unless-stopped          # automatic recovery after any failure
     env_file: .env
     ports:
-      - "8080:8080"
+      - "8080:8080"                  # /health endpoint
     volumes:
-      - ./database:/app/database   # duplicate-alert guard survives restarts
+      - ./database:/app/database     # dedup + scan state survive restarts
       - ./logs:/app/logs
-      - ./config:/app/config
+      - ./config:/app/config         # config.yaml + tv_storage_state.json
+      - ./screenshots/out:/app/screenshots/out

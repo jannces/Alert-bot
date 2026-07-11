@@ -1,34 +1,38 @@
 # Tamad Strategy Scanner
 
-A 24/7 market scanner for **MEXC USDT Perpetual Futures** that detects valid
-**Tamad Strategy** setups on TradingView and notifies you on **Telegram**
-with a TradingView chart screenshot.
+A 24/7 market scanner for **MEXC USDT Perpetual Futures**. Python detects
+valid **Tamad Strategy** setups on every active contract and notifies you on
+**Telegram** with an annotated **TradingView** chart screenshot.
 
 > **This is NOT a trading bot.** It never places, modifies, or closes orders
-> and holds no exchange credentials. Its only outputs are Telegram messages
-> and log entries. Every trade is analyzed and executed manually by you.
+> and holds no exchange credentials — it reads *public* MEXC market data and
+> writes Telegram messages, screenshots, logs, and database rows. Every trade
+> is analyzed and executed manually by you.
 >
-> **Accuracy over quantity.** Every rule is mandatory, every setup passes a
-> final strict validation, and when in doubt the setup is rejected.
+> **Python is the single source of truth.** All scanning, pattern detection,
+> S/R detection, and validation happen in Python. TradingView is strictly a
+> charting and screenshot service.
+>
+> **Accuracy over quantity.** Every rule is mandatory, every candidate passes
+> a final strict validation, and when in doubt the setup is rejected.
 
-## How it works
+## Pipeline
 
 ```
-TradingView (Pine v6)                    This service (Python 3.12)
-┌──────────────────────────┐             ┌────────────────────────────────────┐
-│ Tamad pattern detection  │   webhook   │ 1. authenticate shared secret      │
-│ on MEXC:<SYMBOL>USDT.P   ├────────────►│ 2. re-validate EVERY rule from     │
-│ 15m / 30m / 1h           │  JSON alert │    the raw OHLC of the 3 candles   │
-│ (only after candle 3     │             │ 3. duplicate guard (SQLite)        │
-│  fully closes)           │             │ 4. TradingView chart screenshot    │
-│ + draws the full setup   │             │ 5. Telegram alert with the chart   │
-│   on the chart           │             │ 6. log signal / rejection          │
-└──────────────────────────┘             └────────────────────────────────────┘
+MEXC Futures API → Async Python Scanner → Tamad Strategy Validation
+→ Support/Resistance Validation → Risk Management Calculation
+→ Duplicate Check → TradingView Screenshot (Playwright)
+→ Python-drawn Overlay (Entry/SL/TP/Highlights) → Telegram Notification
+→ SQLite Logging
 ```
 
-TradingView is the single source of truth for candle data, pattern detection,
-alerts, and chart visualization — the screenshot in every alert is the exact
-TradingView chart you would analyze by hand. There is no custom chart UI.
+A sweep fires at every 15m/30m/1h candle close over all active USDT
+perpetuals (discovered automatically, refreshed hourly), rate-limited under
+MEXC's public API limits. Only fully closed candles are ever evaluated, and
+each bar is evaluated exactly once — including across restarts.
+
+The full design, decision record (D1–D4), and known limitations are in
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## The Tamad Strategy (implemented exactly, no approximations)
 
@@ -37,49 +41,47 @@ A strict three-candle rejection pattern at meaningful support/resistance.
 | | SHORT | LONG |
 |---|---|---|
 | Candle 1 | Green | Red |
-| Candle 2 | Red, close **equal** to candle 1's close (default tolerance 0.05%) | Green, equal close |
+| Candle 2 | Red, close **equal** to candle 1's close (default tolerance 0.1%) | Green, equal close |
 | Level | The equal closes form the **resistance** | The equal closes form the **support** |
 | Candle 3 | Green, fully **closed**. Wick may pierce the resistance, close must be ≤ resistance | Red, fully closed. Wick may pierce the support, close must be ≥ support |
-| S/R filter | Pattern must sit at a meaningful level (swing high/low, previous day/week high/low, pivot) — middle-of-range patterns are rejected | same |
-| Entry | Close of candle 3 | Close of candle 3 |
+| S/R filter | *Optional, off by default.* When enabled, the pattern must sit within `proximity_percent` of a confirmed swing high/low | same |
+| Entry | **Close of Candle 3** (never next-candle open, market price, or midpoint) | same |
 | Stop loss | **Highest wick** of the three candles | **Lowest wick** of the three candles |
-| Targets | TP2 = 2R, TP3 = 3R | same |
+| Targets | Risk = Entry − SL; TP2 = 2R, TP3 = 3R | Risk = Entry − SL; TP2 = 2R, TP3 = 3R |
 
 The stop loss uses *only* the three strategy candles — never ATR, never
-percentages, never indicators.
+percentages, never indicators, never volatility.
 
-### Defense in depth
-
-Pattern rules are enforced **twice**: once in Pine Script on TradingView, and
-again in `strategy/validation.py`, which recomputes every rule from the raw
-OHLC values carried in the webhook (candle colors, equal-close, third-candle
-rule, S/R proximity and side, closed-candle confirmation, entry, stop, TP2,
-TP3, signal freshness, symbol/timeframe scope). If **any** check fails, no
-alert is sent and the rejection is logged with its reasons.
+Every candidate passes a final validation gate that recomputes every rule
+from the raw candle data (colors, equal close, third-candle rule, S/R
+presence/side/proximity, closed-candle confirmation, freshness, entry, stop,
+TP2, TP3). Any failure → rejected, logged, never sent.
 
 ## Project layout
 
 ```
-├── tradingview/
-│   ├── pine_script.pine     # Pine v6: detection + chart drawings + webhook alert
-│   └── webhook_handler.py   # FastAPI endpoint: auth, schema validation, enqueue
+├── mexc/client.py               # public futures data client (read-only, rate-limited)
+├── scanner/
+│   ├── scheduler.py             # candle-close boundary scheduling
+│   └── engine.py                # sweep → pre-filter → build candidates
 ├── strategy/
-│   ├── models.py            # Candle / TamadSetup / ValidationReport value objects
-│   ├── tamad_strategy.py    # pure pattern rules (single source of truth)
-│   ├── validation.py        # final strict validation gate
-│   └── pipeline.py          # validate → dedup → screenshot → notify worker
-├── telegram/
-│   └── bot.py               # Telegram Bot API client + alert formatting
+│   ├── models.py                # Candle / SRLevel / TamadSetup / ValidationReport
+│   ├── tamad_strategy.py        # pattern rules (single source of truth)
+│   ├── sr_levels.py             # S/R detection (swing high/low; extensible)
+│   ├── validation.py            # final strict validation gate
+│   └── pipeline.py              # dedup → screenshot → annotate → notify → persist
 ├── screenshots/
-│   └── capture.py           # TradingView chart capture (Playwright / chart-img)
-├── database/
-│   └── repository.py        # SQLite: signals, rejections, duplicate guard
-├── config/
-│   ├── config.yaml          # all knobs, env-expanded (${VAR})
-│   ├── settings.py          # typed config loading (pydantic)
-│   └── logging_setup.py     # console + rotating file logs
-├── tests/                   # unit + pipeline tests (pytest)
-└── main.py                  # entrypoint
+│   ├── capture.py               # Playwright capture of your TradingView layout
+│   ├── calibration.py           # pixel↔price mapping (best-effort, auto-fallback)
+│   └── annotate.py              # Pillow overlay: highlights, level lines, legend
+├── tradingview/
+│   ├── links.py                 # live-chart links for alerts
+│   └── pine_overlay.pine        # OPTIONAL display-only fallback (draws, never decides)
+├── telegram/bot.py              # alert formatting + Bot API delivery
+├── database/repository.py       # signal snapshots, rejections, dedup, scan state
+├── config/config.yaml           # every knob, documented inline
+├── tests/                       # 113 unit + integration tests
+└── main.py                      # entrypoint (+ /health endpoint)
 ```
 
 ## Setup
@@ -89,94 +91,77 @@ alert is sent and the rejection is logged with its reasons.
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-playwright install chromium        # only for the playwright screenshot provider
+playwright install chromium
 ```
 
-### 2. Configure secrets
+### 2. Configure
 
 ```bash
-cp .env.example .env               # fill in the values
+cp .env.example .env      # TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 set -a; source .env; set +a
 ```
 
-- `WEBHOOK_SECRET` — long random string; also entered in the Pine script input.
-- `TELEGRAM_BOT_TOKEN` — create a bot with [@BotFather](https://t.me/BotFather).
-- `TELEGRAM_CHAT_ID` — your chat/channel id.
+All knobs live in [`config/config.yaml`](config/config.yaml): timeframes,
+symbol whitelist, equal-close tolerance and comparison mode
+(`strict`/`midpoint`), S/R method and sensitivity, rate limits, screenshot
+and annotation behavior, logging.
 
-All other knobs (timeframes, symbols whitelist, equal-close tolerance, swing
-lookback, S/R sensitivity, R multiples, screenshot provider, logging level)
-live in [`config/config.yaml`](config/config.yaml), documented inline.
+### 3. TradingView (visualization only)
 
-### 3. TradingView
+1. Log in to TradingView, build the chart layout you like (colors, zoom
+   showing ~50–100 candles), and **save** it.
+2. Set `screenshots.playwright.chart_url` to your saved layout URL, e.g.
+   `https://www.tradingview.com/chart/AbCdEfGh/`.
+3. Export a login session once so Playwright can open your private layout:
 
-1. Open the Pine Editor, paste [`tradingview/pine_script.pine`](tradingview/pine_script.pine),
-   **Save** and **Add to chart**, then save the chart layout.
-2. In the indicator settings, set **Webhook Secret** to your `WEBHOOK_SECRET`
-   and keep the other inputs identical to `config.yaml` (tolerance, level
-   basis, swing lookback, S/R proximity).
-3. Create an alert:
-   - **Condition:** `Tamad Strategy Scanner` → *Any alert() function call*
-   - **Options:** *Once per bar close*
-   - **Webhook URL:** `https://<your-host>/webhook/tradingview`
-4. Repeat for each MEXC symbol (`MEXC:BTCUSDT.P`, …) and timeframe
-   (15m / 30m / 1h) you want scanned. TradingView requires one alert per
-   symbol+timeframe; the number of simultaneous alerts depends on your
-   TradingView plan. Prioritize the pairs you actually trade, or use
-   watchlist-wide alerts if your plan supports them.
+   ```bash
+   python -m playwright codegen --save-storage=config/tv_storage_state.json https://www.tradingview.com
+   # log in in the opened browser, then close it
+   ```
 
-The indicator draws the complete setup on the chart — highlighted pattern
-candles, S/R line, entry, stop loss, TP2, TP3 — so the screenshot contains
-every annotation.
+No Pine script, no alerts, no webhooks — TradingView performs zero
+calculations. (If pixel calibration ever proves unreliable on your layout,
+`tradingview/pine_overlay.pine` is an optional display-only fallback; see
+ARCHITECTURE.md §7.)
 
-### 4. Screenshots
-
-**Playwright (default).** Point `screenshots.playwright.chart_url` at your
-saved TradingView layout (the one with the indicator applied), e.g.
-`https://www.tradingview.com/chart/AbCdEfGh/`. For a private layout, export a
-login session once:
-
-```bash
-python -m playwright codegen --save-storage=config/tv_storage_state.json https://www.tradingview.com
-# log in in the opened browser, then close it
-```
-
-**chart-img.** Set `screenshots.provider: chart_img` and `CHART_IMG_API_KEY`
-(no browser needed, requires a [chart-img.com](https://chart-img.com) key).
-
-If a screenshot cannot be captured, the behavior is yours to choose via
-`screenshots.on_failure`: `send_without_image` (default — the alert arrives
-with a warning line) or `skip_alert` (strictest — no image, no alert).
-
-### 5. Run
+### 4. Run
 
 ```bash
 python main.py --config config/config.yaml
 ```
 
-or with Docker (auto-restarts, state persisted on the host):
+or 24/7 with Docker (auto-restart, state persisted on the host):
 
 ```bash
 docker compose up -d --build
 ```
 
-The webhook endpoint must be reachable from TradingView over HTTPS — put it
-behind a reverse proxy (Caddy/nginx) or a tunnel. `GET /health` reports queue
-and counter stats for monitoring.
+`GET :8080/health` reports last sweep per timeframe and counters.
 
-## Reliability
+## Alerts
 
-- **No duplicates, ever:** each setup's identity (exchange, symbol,
-  timeframe, direction, candle-3 bar time) is claimed atomically in SQLite
-  *before* sending; the guard survives restarts and crashes.
-- **No unfinished candles:** Pine fires only on confirmed bar close, and the
-  validator independently confirms candle 3's close time has passed. Stale
-  alerts (older than `max_alert_age_seconds`) are rejected.
-- **Crash-proof worker:** webhook responds instantly; a background worker
-  processes the queue and survives any per-alert error. Telegram sends are
-  retried with backoff and honor rate limits; a failed send releases the
-  dedup reservation so the alert can be replayed.
-- **Full audit trail:** every sent signal and every rejection (with per-rule
-  reasons) is stored in SQLite and logged to `logs/tamad.log` (rotating).
+Each Telegram alert contains pair, direction, timeframe, entry, stop loss,
+TP2/TP3, risk:reward, detection time, a 7-point validation checklist with a
+confidence line ("7 / 7 Rules Passed"), a live TradingView chart link, and
+the annotated screenshot: the three pattern candles highlighted, S/R, entry,
+SL, TP2, TP3 drawn as price-anchored lines plus a legend panel. When pixel
+calibration fails on a capture, the image degrades gracefully to
+chart + legend (numbers always exact); when capture fails entirely, the
+configured `on_failure` policy applies.
+
+## Persistence & logging
+
+- **Signals:** every sent alert stores a complete snapshot — OHLC of all
+  three candles, levels, entry/SL/TP, S/R details, screenshot path,
+  timestamps, and the validation report. Ready-made data for future
+  backtesting and win-rate analytics.
+- **Rejections:** near-miss candidates (matched colors + equal close but
+  failed a later rule) are stored with passed rules, failed rules, failure
+  reason, and candle OHLC — precise debugging without millions of "no
+  pattern" rows.
+- **Duplicate protection:** dedup keys are claimed atomically in SQLite
+  *before* sending and survive restarts; a sent setup can never repeat.
+- **Operational logs:** rotating structured logs in `logs/tamad.log`.
 
 ## Tests
 
@@ -184,17 +169,17 @@ and counter stats for monitoring.
 pytest
 ```
 
-Covers the pattern rules (colors, tolerance boundaries, third-candle rule,
-doji rejection, trade levels), the strict validation gate (each failure
-mode), the duplicate guard (including restart survival), webhook auth and
-parsing, Telegram formatting, and the end-to-end pipeline.
+Covers the pattern rules and tolerance boundaries, S/R detection (including
+confirmation lag and plateau edge cases), the validation gate (every failure
+mode), boundary scheduling math, the sweep engine against a fake MEXC client
+(forming-candle handling, evaluate-once, restart survival), the MEXC client
+(mocked transport), annotation rendering, alert formatting, the duplicate
+guard, and the end-to-end pipeline.
 
 ## Future expansion
 
-The layered design keeps additions localized: new strategies implement their
-own rules module + validator alongside `strategy/tamad_strategy.py`; the
-pipeline, Telegram, screenshots, and persistence layers are strategy-agnostic.
-Planned directions: backtesting and win-rate statistics on the stored signal
-history, multi-timeframe confirmation, volume/EMA/RSI filters, order-block /
-liquidity-sweep / MSS / FVG detection, and Telegram commands (`/status`,
-`/pairs`, `/settings`).
+New S/R methods (fractals, daily/weekly high-low, pivots) implement the
+`SRDetector` interface; new strategies add their own rules module beside
+`tamad_strategy.py` — the scanner, pipeline, Telegram, screenshot, and
+persistence layers are strategy-agnostic. The stored signal snapshots are the
+foundation for backtesting, win-rate statistics, and analytics dashboards.
