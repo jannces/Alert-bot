@@ -97,8 +97,10 @@ class TestRejections:
         from tests.fixtures import NOW_MS
 
         repo = make_repo(tmp_path)
+        settings = Settings()
+        settings.strategy.support_resistance.enabled = True
         setup = make_short_setup(sr=None)  # middle of a range → near-miss
-        report = FinalValidator(Settings(), now_ms=lambda: NOW_MS).validate(setup)
+        report = FinalValidator(settings, now_ms=lambda: NOW_MS).validate(setup)
         assert not report.passed
         repo.record_rejection(setup, report)
 

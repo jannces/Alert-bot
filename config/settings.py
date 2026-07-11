@@ -82,13 +82,17 @@ class MexcSettings(BaseModel):
 
 
 class EqualCloseSettings(BaseModel):
-    tolerance_percent: float = Field(default=0.05, ge=0)
+    tolerance_percent: float = Field(default=0.1, ge=0)
     # "average" is intentionally not offered: with two candles it is
     # mathematically identical to "midpoint" (see ARCHITECTURE.md, D2).
     comparison_mode: Literal["strict", "midpoint"] = "strict"
 
 
 class SupportResistanceSettings(BaseModel):
+    # The S/R confirmation is optional. When disabled, patterns anywhere on
+    # the chart qualify (middle-of-range setups included) and the alert
+    # checklist shrinks accordingly.
+    enabled: bool = False
     method: Literal["swing_high_low"] = "swing_high_low"
     left_bars: int = Field(default=20, ge=1)
     right_bars: int = Field(default=20, ge=1)

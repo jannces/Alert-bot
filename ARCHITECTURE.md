@@ -124,7 +124,8 @@ Deleted per D4: `tradingview/pine_script.pine`, `tradingview/webhook_handler.py`
 ## 5. Strategy rules (100% Python)
 
 - **Candle colors** — SHORT: green/red/green; LONG: red/green/red; dojis fail.
-- **Equal close** — |close₁ − close₂| ≤ close₁ × `tolerance_percent` / 100.
+- **Equal close** — |close₁ − close₂| ≤ close₁ × `tolerance_percent` / 100
+  (default 0.1%; raised from 0.05% by owner decision, 2026-07).
 - **Level** (`comparison_mode`):
   - `strict` *(default)* — the close Candle 3 is least allowed to break
     (SHORT: lower of the two closes; LONG: higher). When in doubt, reject.
@@ -143,11 +144,18 @@ Deleted per D4: `tradingview/pine_script.pine`, `tradingview/webhook_handler.py`
 
 ```yaml
 support_resistance:
+  enabled: false          # optional filter — OFF by default (owner decision,
+                          # 2026-07: it rejected too many otherwise-valid
+                          # patterns; re-enable any time)
   method: swing_high_low
   left_bars: 20
   right_bars: 20
   proximity_percent: 0.25
 ```
+
+When disabled, the engine skips level detection, the validator skips the
+S/R checks, and the Telegram checklist shows 6 rules instead of 7. When
+enabled:
 
 `SRDetector.find_levels(candles) -> list[SRLevel]` is the interface;
 `swing_high_low` (a bar strictly exceeding `left_bars` highs before and

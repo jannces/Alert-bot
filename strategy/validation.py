@@ -118,16 +118,19 @@ class FinalValidator:
             )
         )
 
-        # --- rule 4: meaningful support/resistance --------------------------------
+        # --- rule 4: meaningful support/resistance (optional filter) --------------
+        # When the S/R confirmation is disabled, these checks are skipped
+        # entirely: the pattern alone qualifies.
         sr = setup.sr
-        add(
-            CheckResult(
-                "sr_present",
-                sr is not None,
-                "no meaningful S/R level near the pattern (middle of a range)",
+        if cfg.strategy.support_resistance.enabled:
+            add(
+                CheckResult(
+                    "sr_present",
+                    sr is not None,
+                    "no meaningful S/R level near the pattern (middle of a range)",
+                )
             )
-        )
-        if sr is not None:
+        if cfg.strategy.support_resistance.enabled and sr is not None:
             required_side = "high" if direction is Direction.SHORT else "low"
             add(
                 CheckResult(

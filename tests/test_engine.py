@@ -66,8 +66,11 @@ class PipelineStub:
         self.setups.append(setup)
 
 
-def make_engine(tmp_path, client) -> tuple[ScanEngine, PipelineStub, SignalRepository]:
+def make_engine(
+    tmp_path, client, *, sr_enabled: bool = True
+) -> tuple[ScanEngine, PipelineStub, SignalRepository]:
     settings = Settings()
+    settings.strategy.support_resistance.enabled = sr_enabled
     settings.strategy.support_resistance.left_bars = 3
     settings.strategy.support_resistance.right_bars = 3
     repo = SignalRepository(tmp_path / "engine.sqlite3")
@@ -99,6 +102,17 @@ async def test_pattern_becomes_a_fully_built_candidate(tmp_path):
     assert setup.sr is not None
     assert setup.sr.kind is SRKind.SWING_HIGH and setup.sr.price == 110.1
     assert setup.candle3.open_time_ms == t(19)  # the just-closed bar
+
+
+@pytest.mark.asyncio
+async def test_sr_lookup_skipped_when_filter_disabled(tmp_path):
+    engine, pipeline, _ = make_engine(
+        tmp_path, FakeMexcClient(pattern_series()), sr_enabled=False
+    )
+    await engine.sweep([TF], BOUNDARY_MS)
+
+    assert len(pipeline.setups) == 1
+    assert pipeline.setups[0].sr is None  # candidate still fully built
 
 
 @pytest.mark.asyncio

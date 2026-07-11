@@ -41,10 +41,10 @@ A strict three-candle rejection pattern at meaningful support/resistance.
 | | SHORT | LONG |
 |---|---|---|
 | Candle 1 | Green | Red |
-| Candle 2 | Red, close **equal** to candle 1's close (default tolerance 0.05%) | Green, equal close |
+| Candle 2 | Red, close **equal** to candle 1's close (default tolerance 0.1%) | Green, equal close |
 | Level | The equal closes form the **resistance** | The equal closes form the **support** |
 | Candle 3 | Green, fully **closed**. Wick may pierce the resistance, close must be ≤ resistance | Red, fully closed. Wick may pierce the support, close must be ≥ support |
-| S/R filter | Pattern must sit within `proximity_percent` of a confirmed swing high/low — middle-of-range patterns are rejected | same |
+| S/R filter | *Optional, off by default.* When enabled, the pattern must sit within `proximity_percent` of a confirmed swing high/low | same |
 | Entry | **Close of Candle 3** (never next-candle open, market price, or midpoint) | same |
 | Stop loss | **Highest wick** of the three candles | **Lowest wick** of the three candles |
 | Targets | Risk = Entry − SL; TP2 = 2R, TP3 = 3R | Risk = Entry − SL; TP2 = 2R, TP3 = 3R |

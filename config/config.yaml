@@ -45,7 +45,9 @@ mexc:
 strategy:
   equal_close:
     # Max difference between candle 1 and candle 2 closes, in percent.
-    tolerance_percent: 0.05
+    # This is the main sensitivity knob: raise it for more candidates,
+    # lower it for stricter "equal" closes.
+    tolerance_percent: 0.1
     # How the exact level is derived from the two near-equal closes:
     #   strict   — the close candle 3 is least allowed to break (default;
     #              when in doubt, reject)
@@ -54,6 +56,11 @@ strategy:
     #  the midpoint — see ARCHITECTURE.md, decision D2.)
     comparison_mode: strict
   support_resistance:
+    # Optional confirmation that the pattern formed at a meaningful S/R
+    # level. DISABLED: patterns anywhere on the chart qualify, and the
+    # alert checklist drops the S/R row (6 rules instead of 7).
+    # Re-enable by setting this to true — the settings below then apply.
+    enabled: false
     # Only swing_high_low is implemented; fractals, daily/weekly high-low
     # and pivots plug in behind the same interface later.
     method: swing_high_low

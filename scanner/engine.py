@@ -141,13 +141,15 @@ class ScanEngine:
             c2.close,
             ComparisonMode(strategy_cfg.equal_close.comparison_mode),
         )
-        side = "high" if direction.value == "SHORT" else "low"
-        sr = nearest_level(
-            self._sr_detector.find_levels(closed),
-            side,
-            level,
-            strategy_cfg.support_resistance.proximity_percent,
-        )
+        sr = None
+        if strategy_cfg.support_resistance.enabled:
+            side = "high" if direction.value == "SHORT" else "low"
+            sr = nearest_level(
+                self._sr_detector.find_levels(closed),
+                side,
+                level,
+                strategy_cfg.support_resistance.proximity_percent,
+            )
         levels = rules.compute_trade_levels(direction, c1, c2, c3)
 
         setup = TamadSetup(

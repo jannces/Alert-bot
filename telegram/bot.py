@@ -63,11 +63,18 @@ def build_alert_message(
         "%Y-%m-%d %H:%M:%S UTC"
     )
     passed = set(report.passed_names)
+    all_names = {check.name for check in report.checks}
     checklist = []
-    total = len(_CHECKLIST)
+    total = 0
     ok_count = 0
     for label, check_names in _CHECKLIST:
-        ok = all(name in passed for name in check_names)
+        # Rows whose rules were not evaluated at all (e.g. the S/R filter is
+        # disabled in config) are omitted rather than shown as failures.
+        relevant = [name for name in check_names if name in all_names]
+        if not relevant:
+            continue
+        ok = all(name in passed for name in relevant)
+        total += 1
         ok_count += ok
         checklist.append(f"{'✅' if ok else '❌'} {label}")
 

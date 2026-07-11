@@ -47,7 +47,9 @@ class TestAlertMessage:
         ):
             assert expected in text, f"missing {expected!r}"
 
-    def test_validation_checklist_shows_seven_passing_rules(self, validator):
+    def test_validation_checklist_default_has_six_rules(self, validator):
+        # The S/R confirmation is disabled by default, so its checklist row
+        # is omitted rather than shown as a failure.
         setup = make_short_setup()
         text = build_alert_message(
             setup, validator.validate(setup), CHART_URL, screenshot_ok=True
@@ -57,12 +59,23 @@ class TestAlertMessage:
             "Candle 2 Color",
             "Candle 3 Rule",
             "Equal Close",
-            "Support / Resistance",
             "Stop Loss",
             "Take Profit",
         ):
             assert f"✅ {label}" in text
+        assert "Support / Resistance" not in text
         assert "❌" not in text
+        assert "6 / 6 Rules Passed" in text
+
+    def test_validation_checklist_shows_seven_rules_with_sr_enabled(self):
+        settings = Settings()
+        settings.strategy.support_resistance.enabled = True
+        validator = FinalValidator(settings, now_ms=lambda: NOW_MS)
+        setup = make_short_setup()
+        text = build_alert_message(
+            setup, validator.validate(setup), CHART_URL, screenshot_ok=True
+        )
+        assert "✅ Support / Resistance" in text
         assert "7 / 7 Rules Passed" in text
 
     def test_tradingview_link_is_included(self, validator):
@@ -81,7 +94,7 @@ class TestAlertMessage:
             setup, validator.validate(setup), CHART_URL, screenshot_ok=True
         )
         assert "LONG" in text
-        assert "7 / 7 Rules Passed" in text
+        assert "6 / 6 Rules Passed" in text
 
     def test_missing_screenshot_adds_warning(self, validator):
         setup = make_short_setup()

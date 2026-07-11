@@ -22,6 +22,14 @@ def validator(settings: Settings) -> FinalValidator:
     return FinalValidator(settings, now_ms=lambda: NOW_MS)
 
 
+@pytest.fixture()
+def sr_validator() -> FinalValidator:
+    """Validator with the (optional) S/R confirmation switched on."""
+    settings = Settings()
+    settings.strategy.support_resistance.enabled = True
+    return FinalValidator(settings, now_ms=lambda: NOW_MS)
+
+
 def failed_names(report) -> set[str]:
     return {check.name for check in report.failed_checks}
 
@@ -44,9 +52,6 @@ class TestValidSetup:
             "candle3_color",
             "equal_close",
             "third_candle_rule",
-            "sr_present",
-            "sr_side",
-            "sr_proximity",
             "candle3_closed",
             "signal_fresh",
             "entry_price",
@@ -54,6 +59,17 @@ class TestValidSetup:
             "tp2",
             "tp3",
         } <= names
+
+    def test_sr_checks_only_run_when_filter_enabled(self, validator, sr_validator):
+        default_names = {c.name for c in validator.validate(make_short_setup()).checks}
+        assert not {"sr_present", "sr_side", "sr_proximity"} & default_names
+
+        sr_names = {c.name for c in sr_validator.validate(make_short_setup()).checks}
+        assert {"sr_present", "sr_side", "sr_proximity"} <= sr_names
+
+    def test_middle_of_range_passes_when_sr_disabled(self, validator):
+        # S/R confirmation off: a pattern with no nearby level is valid.
+        assert validator.validate(make_short_setup(sr=None)).passed
 
 
 class TestRejections:
@@ -86,19 +102,19 @@ class TestRejections:
         report = late.validate(make_short_setup())
         assert "signal_fresh" in failed_names(report)
 
-    def test_missing_sr_rejected_as_middle_of_range(self, validator):
-        report = validator.validate(make_short_setup(sr=None))
+    def test_missing_sr_rejected_when_filter_enabled(self, sr_validator):
+        report = sr_validator.validate(make_short_setup(sr=None))
         assert "sr_present" in failed_names(report)
 
-    def test_sr_on_wrong_side_rejected(self, validator):
+    def test_sr_on_wrong_side_rejected(self, sr_validator):
         # A swing LOW is not resistance for a SHORT.
-        report = validator.validate(
+        report = sr_validator.validate(
             make_short_setup(sr=SRLevel(kind=SRKind.SWING_LOW, price=110.05))
         )
         assert "sr_side" in failed_names(report)
 
-    def test_sr_too_far_from_pattern_rejected(self, validator):
-        report = validator.validate(
+    def test_sr_too_far_from_pattern_rejected(self, sr_validator):
+        report = sr_validator.validate(
             make_short_setup(sr=SRLevel(kind=SRKind.SWING_HIGH, price=113.0))
         )
         assert "sr_proximity" in failed_names(report)

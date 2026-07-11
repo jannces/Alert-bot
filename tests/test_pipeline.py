@@ -88,7 +88,7 @@ async def test_duplicate_alert_is_suppressed(tmp_path):
 @pytest.mark.asyncio
 async def test_invalid_setup_is_rejected_and_logged(tmp_path):
     pipeline, repo, screenshots, notifier = make_pipeline(tmp_path)
-    await pipeline.process(make_short_setup(sr=None))  # middle of a range
+    await pipeline.process(make_short_setup(tp2=1.0))  # inconsistent target
 
     assert not notifier.sent
     assert screenshots.calls == 0  # rejected before any capture
