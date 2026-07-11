@@ -16,7 +16,7 @@ Telegram messages, log lines, and database rows. Nothing else.
 | # | Decision |
 |---|---|
 | **D1** | Screenshots come from Playwright driving the owner's saved TradingView layout. All annotations (3-candle highlight, S/R, entry, SL, TP2, TP3, legend) are drawn **by Python (Pillow) onto the captured image**, so they always match the Python-validated signal. Pine overlays are **not** used for strategy visualization; a display-only Pine overlay remains available solely as a documented fallback if pixel calibration proves unreliable in the field (§7). |
-| **D2** | `comparison_mode` supports only `strict` (default) and `midpoint`. **`average` was removed** because with exactly two reference candles the arithmetic mean of the two closes *is* the midpoint — two names for one behavior invite config confusion without adding capability. |
+| **D2** | `comparison_mode` supports `strict`, `midpoint`, and `outer` (added 2026-07, now the default — see §5). **`average` was removed** because with exactly two reference candles the arithmetic mean of the two closes *is* the midpoint — two names for one behavior invite config confusion without adding capability. |
 | **D3** | Rejections are logged **only for near-miss candidates**: setups that passed the pattern pre-filter (candle colors + equal close) but failed one or more later rules. Each rejection stores pair, timeframe, detection time, rules passed, rules failed, OHLC of all three candles, and the failure reason. Plain "no pattern on this bar" is never persisted. |
 | **D4** | The v1 TradingView-detection architecture is **deleted**: the detection Pine script, the webhook endpoint, and all webhook-payload handling. Git history preserves them. Only a minimal `/health` endpoint remains for monitoring. |
 
@@ -127,9 +127,14 @@ Deleted per D4: `tradingview/pine_script.pine`, `tradingview/webhook_handler.py`
 - **Equal close** — |close₁ − close₂| ≤ close₁ × `tolerance_percent` / 100
   (default 0.1%; raised from 0.05% by owner decision, 2026-07).
 - **Level** (`comparison_mode`):
-  - `strict` *(default)* — the close Candle 3 is least allowed to break
-    (SHORT: lower of the two closes; LONG: higher). When in doubt, reject.
+  - `outer` *(default; owner decision 2026-07)* — the far edge of the zone
+    the two closes span (SHORT: higher close; LONG: lower). Candle 3 may
+    close anywhere inside the equal-close zone. Adopted after a live BTC
+    example where Candle 3 closed between the two closes — visually a
+    textbook rejection — and `strict` refused it.
   - `midpoint` — `(close₁ + close₂) / 2`.
+  - `strict` — the close Candle 3 is least allowed to break
+    (SHORT: lower of the two closes; LONG: higher). Harshest reading.
   - *(`average` intentionally not offered — see D2.)*
 - **Third candle rule** — wick may pierce the level; the close must not.
 - **Entry** — Candle 3 close. Never next-candle open, market price, or midpoint.
@@ -287,8 +292,8 @@ mexc:
 
 strategy:
   equal_close:
-    tolerance_percent: 0.05
-    comparison_mode: strict          # strict | midpoint
+    tolerance_percent: 0.1
+    comparison_mode: outer           # outer | midpoint | strict
   support_resistance:
     method: swing_high_low
     left_bars: 20

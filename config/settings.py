@@ -85,7 +85,7 @@ class EqualCloseSettings(BaseModel):
     tolerance_percent: float = Field(default=0.1, ge=0)
     # "average" is intentionally not offered: with two candles it is
     # mathematically identical to "midpoint" (see ARCHITECTURE.md, D2).
-    comparison_mode: Literal["strict", "midpoint"] = "strict"
+    comparison_mode: Literal["strict", "midpoint", "outer"] = "outer"
 
 
 class SupportResistanceSettings(BaseModel):

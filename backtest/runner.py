@@ -141,7 +141,9 @@ async def main() -> None:
     parser.add_argument("--symbols", nargs="*", default=DEFAULT_SYMBOLS)
     parser.add_argument("--tolerance", type=float, default=0.1,
                         help="equal-close tolerance %% (match config.yaml)")
-    parser.add_argument("--mode", default="strict", choices=["strict", "midpoint"])
+    parser.add_argument(
+        "--mode", default="outer", choices=["strict", "midpoint", "outer"]
+    )
     parser.add_argument("--horizon", type=int, default=400,
                         help="bars before an unresolved trade times out")
     args = parser.parse_args()

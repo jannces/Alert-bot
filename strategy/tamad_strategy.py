@@ -36,10 +36,14 @@ class ComparisonMode(str, enum.Enum):
     The two closes only match within a tolerance, so a rule is needed to pick
     the exact level Candle 3 is compared against:
 
-    - ``STRICT`` (default): the close Candle 3 is *least* allowed to break —
-      the lower of the two closes for a SHORT, the higher for a LONG.
-      When in doubt, reject.
+    - ``STRICT``: the close Candle 3 is *least* allowed to break — the lower
+      of the two closes for a SHORT, the higher for a LONG. Harshest reading.
     - ``MIDPOINT``: the midpoint of the two closes.
+    - ``OUTER``: the far edge of the equal-close zone — the higher close for
+      a SHORT, the lower for a LONG. Candle 3 may close anywhere inside the
+      zone the two closes span. This matches reading the pair of closes as
+      one resistance/support *area* (owner decision, 2026-07, after a live
+      BTC example where Candle 3 closed between the two closes).
 
     An ``average`` mode was deliberately NOT added: with exactly two
     reference candles the arithmetic mean of the closes is identical to the
@@ -48,6 +52,7 @@ class ComparisonMode(str, enum.Enum):
 
     STRICT = "strict"
     MIDPOINT = "midpoint"
+    OUTER = "outer"
 
 
 def equal_close(close1: float, close2: float, tolerance_pct: float) -> bool:
@@ -66,10 +71,14 @@ def pattern_level(
     """The support/resistance level implied by the two equal closes."""
     if mode is ComparisonMode.MIDPOINT:
         return (close1 + close2) / 2.0
-    if direction is Direction.SHORT:
-        # Resistance: the lower close is the level hardest to satisfy.
+    if mode is ComparisonMode.OUTER:
+        # The far edge of the zone the two closes span.
+        if direction is Direction.SHORT:
+            return max(close1, close2)
         return min(close1, close2)
-    # Support: the higher close is the level hardest to satisfy.
+    if direction is Direction.SHORT:
+        # STRICT — the lower close is the level hardest to satisfy.
+        return min(close1, close2)
     return max(close1, close2)
 
 

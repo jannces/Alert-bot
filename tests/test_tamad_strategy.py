@@ -50,9 +50,14 @@ class TestPatternLevel:
         assert pattern_level(Direction.SHORT, 100.0, 102.0, ComparisonMode.MIDPOINT) == 101.0
         assert pattern_level(Direction.LONG, 100.0, 102.0, ComparisonMode.MIDPOINT) == 101.0
 
+    def test_outer_uses_far_edge_of_the_zone(self):
+        # SHORT: resistance is the HIGHER close; LONG: support is the LOWER.
+        assert pattern_level(Direction.SHORT, 110.0, 110.02, ComparisonMode.OUTER) == 110.02
+        assert pattern_level(Direction.LONG, 110.0, 110.02, ComparisonMode.OUTER) == 110.0
+
     def test_average_mode_does_not_exist(self):
         # D2: "average" ≡ midpoint with two candles, so it was dropped.
-        assert [m.value for m in ComparisonMode] == ["strict", "midpoint"]
+        assert [m.value for m in ComparisonMode] == ["strict", "midpoint", "outer"]
 
 
 class TestCandleColors:

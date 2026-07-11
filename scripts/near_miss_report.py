@@ -83,8 +83,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=20, help="rows to print")
     parser.add_argument(
         "--mode",
-        default="strict",
-        choices=["strict", "midpoint"],
+        default="outer",
+        choices=["strict", "midpoint", "outer"],
         help="must match strategy.equal_close.comparison_mode in config.yaml",
     )
     args = parser.parse_args()

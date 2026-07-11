@@ -103,8 +103,8 @@ set -a; source .env; set +a
 
 All knobs live in [`config/config.yaml`](config/config.yaml): timeframes,
 symbol whitelist, equal-close tolerance and comparison mode
-(`strict`/`midpoint`), S/R method and sensitivity, rate limits, screenshot
-and annotation behavior, logging.
+(`outer`/`midpoint`/`strict`), S/R method and sensitivity, rate limits,
+screenshot and annotation behavior, logging.
 
 ### 3. TradingView (visualization only)
 

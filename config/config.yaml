@@ -49,12 +49,14 @@ strategy:
     # lower it for stricter "equal" closes.
     tolerance_percent: 0.1
     # How the exact level is derived from the two near-equal closes:
-    #   strict   — the close candle 3 is least allowed to break (default;
-    #              when in doubt, reject)
+    #   outer    — the far edge of the zone the two closes span (default:
+    #              candle 3 may close anywhere inside the equal-close zone;
+    #              matches reading the two closes as one S/R *area*)
     #   midpoint — midpoint of the two closes
+    #   strict   — the close candle 3 is least allowed to break (harshest)
     # ("average" is intentionally not offered: with two candles it equals
     #  the midpoint — see ARCHITECTURE.md, decision D2.)
-    comparison_mode: strict
+    comparison_mode: outer
   support_resistance:
     # Optional confirmation that the pattern formed at a meaningful S/R
     # level. DISABLED: patterns anywhere on the chart qualify, and the

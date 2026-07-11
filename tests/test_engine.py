@@ -98,7 +98,7 @@ async def test_pattern_becomes_a_fully_built_candidate(tmp_path):
     assert setup.entry == 109.5  # candle 3 close
     assert setup.stop_loss == 113.0  # extreme wick
     assert setup.tp2 == 102.5 and setup.tp3 == 99.0
-    assert setup.level == 110.0  # strict comparison mode
+    assert setup.level == 110.02  # outer comparison mode (the default)
     assert setup.sr is not None
     assert setup.sr.kind is SRKind.SWING_HIGH and setup.sr.price == 110.1
     assert setup.candle3.open_time_ms == t(19)  # the just-closed bar

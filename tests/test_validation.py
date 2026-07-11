@@ -140,17 +140,38 @@ class TestRejections:
         assert "candle_order" in failed_names(report)
 
     def test_level_inconsistency_rejected(self, validator):
-        report = validator.validate(make_short_setup(level=110.02))
+        # Default mode is outer → correct level is 110.02, not 110.0.
+        report = validator.validate(make_short_setup(level=110.0))
         assert "level_consistency" in failed_names(report)
 
     def test_midpoint_mode_changes_the_level(self, settings):
         settings.strategy.equal_close.comparison_mode = "midpoint"
         validator = FinalValidator(settings, now_ms=lambda: NOW_MS)
-        # strict level (110.0) no longer matches the midpoint (110.01).
+        # outer level (110.02) no longer matches the midpoint (110.01).
         assert "level_consistency" in failed_names(
             validator.validate(make_short_setup())
         )
         assert validator.validate(make_short_setup(level=110.01)).passed
+
+    def test_close_inside_the_zone_passes_outer_but_fails_strict(self, settings):
+        """The live BTC example: candle 3 closed between the two equal closes."""
+        base = make_short_setup()
+        in_zone_c3 = replace(base.candle3, close=110.01)  # between 110.00 and 110.02
+        setup = make_short_setup(
+            candle3=in_zone_c3,
+            entry=110.01,
+            risk=2.99,
+            tp2=110.01 - 2 * 2.99,
+            tp3=110.01 - 3 * 2.99,
+        )
+        outer = FinalValidator(settings, now_ms=lambda: NOW_MS)  # default: outer
+        assert outer.validate(setup).passed, outer.validate(setup).summary()
+
+        strict_settings = Settings()
+        strict_settings.strategy.equal_close.comparison_mode = "strict"
+        strict = FinalValidator(strict_settings, now_ms=lambda: NOW_MS)
+        report = strict.validate(make_short_setup(candle3=in_zone_c3, level=110.0))
+        assert "third_candle_rule" in failed_names(report)
 
 
 class TestReportSummary:

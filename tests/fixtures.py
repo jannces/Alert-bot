@@ -28,8 +28,8 @@ def short_candles() -> tuple[Candle, Candle, Candle]:
     """A rule-perfect SHORT pattern.
 
     c1 green closes 110.00, c2 red closes 110.02 (0.018% apart → equal),
-    resistance (strict) = 110.00, c3 green wicks to 112 but closes 109.50.
-    Stop = highest wick 113. Risk = 3.5 → TP2 102.5, TP3 99.0.
+    resistance (outer, the default) = 110.02, c3 green wicks to 112 but
+    closes 109.50. Stop = highest wick 113. Risk = 3.5 → TP2 102.5, TP3 99.
     """
     c1 = Candle(T0, 100.0, 111.0, 99.0, 110.0)
     c2 = Candle(T0 + TF_MS, 112.0, 113.0, 109.5, 110.02)
@@ -55,7 +55,7 @@ def make_short_setup(**overrides) -> TamadSetup:
         candle1=c1,
         candle2=c2,
         candle3=c3,
-        level=110.0,
+        level=110.02,
         sr=SRLevel(kind=SRKind.SWING_HIGH, price=110.05),
         entry=109.5,
         stop_loss=113.0,
@@ -78,7 +78,7 @@ def make_long_setup(**overrides) -> TamadSetup:
         candle1=c1,
         candle2=c2,
         candle3=c3,
-        level=110.02,
+        level=110.0,
         sr=SRLevel(kind=SRKind.SWING_LOW, price=109.9),
         entry=110.5,
         stop_loss=107.0,
